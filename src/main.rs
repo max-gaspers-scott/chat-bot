@@ -7,32 +7,45 @@ use uuid::{uuid, Uuid};
 #[tokio::main]
 async fn main() {
     let user = get_jwt().await;
-    let id = uuid!("f641c623-1ab7-41fe-b10a-7268b96d1467");
+    let id = uuid!("b4fbbad7-a13c-4dc2-b1f3-9776f6f47e2d");
 
-    let mut msg = match get_message(&user, &id).await.unwrap().content {
-        SendibleContent::Text(text) => text.text,
-        _=> String::from("no messages"),
-    };
+    let mut last = get_message(&user, &id).await.unwrap();
 
     loop {
-        let new_msg = get_if_text(&msg.clone(), &user, &id).await;
+        let new = get_message(&user, &id).await.unwrap();
 
-        if new_msg != msg {
+        let new_text = match &new.content {
+            SendibleContent::Text(t) => Some(t.text.clone()),
+            _ => None,
+        };
+        let last_text = match &last.content {
+            SendibleContent::Text(t) => Some(t.text.clone()),
+            _ => None,
+        };
+
+        if new_text != last_text {
             println!("+------------------------+");
             println!("+                        +");
             println!("+    mesage was sent     +");
             println!("+                        +");
             println!("+------------------------+");
+            println!("received: {}", new_text.as_deref().unwrap_or("(non-text)"));
+
+            if new.sender_name != user.username {
+                if let Some(text) = &new_text {
+                    let echo = SendMesage {
+                        sender_name: user.username.clone(),
+                        parent: Some(id),
+                        content: serde_json::json!({ "text": text }),
+                    };
+                    match send_message(&user, &echo).await {
+                        Ok(res) => println!("echo sent (id: {})", res.data.message_id),
+                        Err(e) => println!("failed to send echo: {}", e),
+                    }
+                }
+            }
         }
-        msg = new_msg;
-
-     }
-}
-
-async fn get_if_text(msg: &str, user: &LoginPayload, id: &Uuid) -> String {
-match get_message(user, id).await.unwrap().content {
-        SendibleContent::Text(text) => text.text,
-        _=> msg.to_string(),
+        last = new;
     }
 }
 
@@ -145,7 +158,7 @@ async fn get_message(
 async fn get_jwt() -> LoginPayload {
         let url = format!("{BASE_URL}/auth/login");
         let payload = serde_json::json!({
-            "username": "MGS",
+            "username": "test0",
             "password": "aaa",
         });
 
@@ -188,4 +201,32 @@ async fn get_jwt() -> LoginPayload {
     data.payload
 
         // return Ok(user_info);
+}
+
+#[derive(Deserialize, Debug)]
+struct PostMsgData {
+    message_id: uuid::Uuid,
+}
+
+#[derive(Deserialize, Debug)]
+struct PostMsgRes {
+    data: PostMsgData,
+}
+
+async fn send_message(
+    login: &LoginPayload,
+    message: &SendMesage,
+) -> Result<PostMsgRes, reqwest::Error> {
+    let url = format!("{BASE_URL}/messages");
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(url)
+        .json(message)
+        .bearer_auth(login.token.clone())
+        .send()
+        .await?;
+
+    let parsed_res = response.json::<PostMsgRes>().await?;
+    Ok(parsed_res)
 }
