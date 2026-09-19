@@ -13,3 +13,4 @@ tokio = { version = "1", features = ["full", "time"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
 chrono = { version = "0.4", features = ["serde"] } # For Utc
+cool_cli_input = "0.2.1"

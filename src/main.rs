@@ -1,13 +1,42 @@
-
-use serde::Deserialize;
 use reqwest::Response;
+use serde::Deserialize;
 use serde_json::json;
-use uuid::{uuid, Uuid};
+use uuid::{Uuid, uuid};
 
 #[tokio::main]
 async fn main() {
     let user = get_jwt().await;
-    let id = uuid!("b4fbbad7-a13c-4dc2-b1f3-9776f6f47e2d");
+    // let id = uuid!("b4fbbad7-a13c-4dc2-b1f3-9776f6f47e2d");
+    // get chats
+    let chats = get_chats(&user).await.unwrap();
+    let chats = if chats.status == "success" {
+        chats.payload
+    } else {
+        println!("status: {}", chats.status);
+        panic!()
+    };
+    // ask user to chat name
+    let chat_name = cool_cli_input::get_input("what is the name of the chat you want to lisen in");
+    let chat_name = chat_name.trim();
+    // gett uuid
+
+    // ****************  BAD CODE ****************** //
+    let mut id: Option<Uuid> = None;
+    for c in chats {
+        match c.content {
+            SendibleContent::Title(m) => {
+                let name = m.title;
+                if name == chat_name {
+                    id = Some(c.message_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    let id = match id {
+        Some(id) => id,
+        _ => panic!(),
+    };
 
     let mut last = get_message(&user, &id).await.unwrap();
 
@@ -39,7 +68,7 @@ async fn main() {
                         content: serde_json::json!({ "text": text }),
                     };
                     match send_message(&user, &echo).await {
-                        Ok(res) => println!("echo sent (id: {})", res.data.message_id),
+                        Ok(res) => println!("echo sent (id: {:?})", res.data),
                         Err(e) => println!("failed to send echo: {}", e),
                     }
                 }
@@ -48,7 +77,6 @@ async fn main() {
         last = new;
     }
 }
-
 
 #[derive(Deserialize)]
 struct LoginResponse {
@@ -67,8 +95,7 @@ enum LoginInfo {
     NotLoggedin,
 }
 
-#[derive(Debug, serde::Deserialize)]
- #[derive(Clone)]
+#[derive(Debug, serde::Deserialize, Clone)]
 pub struct Message {
     #[serde(default)]
     pub message_id: uuid::Uuid,
@@ -84,21 +111,19 @@ pub struct MessageResponce {
     pub payload: Vec<Message>,
     pub status: String,
 }
-#[derive(Debug, serde::Deserialize)]
-#[derive(Clone)]
+#[derive(Debug, serde::Deserialize, Clone)]
 struct TextMessage {
     text: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
- #[derive(Clone)]
+#[derive(Clone)]
 pub enum SendibleContent {
     Img(ImgMessage),
     Text(TextMessage),
     Title(TitleMessage),
 }
-
 
 #[derive(serde::Deserialize)]
 struct Img {
@@ -111,24 +136,20 @@ pub struct SendMesage {
     pub parent: Option<uuid::Uuid>,
     pub content: serde_json::Value,
 }
-#[derive(Debug, serde::Deserialize)]
-#[derive(Clone)]
+#[derive(Debug, serde::Deserialize, Clone)]
 struct ImgMessage {
     url: String,
 }
-#[derive(Debug, serde::Deserialize)]
- #[derive(Clone)]
+#[derive(Debug, serde::Deserialize, Clone)]
 struct TitleMessage {
     title: String,
 }
 
 const BASE_URL: &str = "https://bens-chat.team-stingray.com";
 
+// const BASE_URL: &str = "http://localhost:8081";
 
-async fn get_message(
-    login: &LoginPayload,
-    chat_id: &Uuid,
-) -> Result<Message, reqwest::Error> {
+async fn get_message(login: &LoginPayload, chat_id: &Uuid) -> Result<Message, reqwest::Error> {
     let url = format!("{BASE_URL}/messages?parent={}", chat_id);
 
     let client = reqwest::Client::new();
@@ -146,61 +167,60 @@ async fn get_message(
         })
         .unwrap();
 
+    let status = message_responce.status;
     let messages = message_responce.payload;
 
     let end_msg = messages.last().unwrap().clone();
 
     Ok(end_msg)
-
 }
 
-
 async fn get_jwt() -> LoginPayload {
-        let url = format!("{BASE_URL}/auth/login");
-        let payload = serde_json::json!({
-            "username": "test0",
-            "password": "aaa",
-        });
+    let url = format!("{BASE_URL}/auth/login");
+    let payload = serde_json::json!({
+        "username": "test0",
+        "password": "aaa",
+    });
 
-        let client = reqwest::Client::new();
+    let client = reqwest::Client::new();
 
-        let res = match client.post(url).json(&payload).send().await {
-            Ok(res) => res,
-            Err(e) => {
-                println!("Network or request error: {e}. Please try again.");
-                panic!();
-            }
-        };
-
-        if !res.status().is_success() {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            println!(
-                "Login failed (status {}): {}. Please try again.",
-                status, body
-            );
+    let res = match client.post(url).json(&payload).send().await {
+        Ok(res) => res,
+        Err(e) => {
+            println!("Network or request error: {e}. Please try again.");
             panic!();
         }
+    };
 
-        let text = match res.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                println!("Failed to read response: {e}. Please try again.");
-                panic!();
-            }
-        };
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        println!(
+            "Login failed (status {}): {}. Please try again.",
+            status, body
+        );
+        panic!();
+    }
 
-        let data: LoginResponse = match serde_json::from_str(&text) {
-            Ok(data) => data,
-            Err(e) => {
-                println!("Could not parse login response ({e}). Please try again.");
-                panic!();
-            }
-        };
+    let text = match res.text().await {
+        Ok(text) => text,
+        Err(e) => {
+            println!("Failed to read response: {e}. Please try again.");
+            panic!();
+        }
+    };
+
+    let data: LoginResponse = match serde_json::from_str(&text) {
+        Ok(data) => data,
+        Err(e) => {
+            println!("Could not parse login response ({e}). Please try again.");
+            panic!();
+        }
+    };
 
     data.payload
 
-        // return Ok(user_info);
+    // return Ok(user_info);
 }
 
 #[derive(Deserialize, Debug)]
@@ -229,4 +249,26 @@ async fn send_message(
 
     let parsed_res = response.json::<PostMsgRes>().await?;
     Ok(parsed_res)
+}
+
+#[derive(Deserialize)]
+struct ChatResponce {
+    payload: Vec<Message>,
+    status: String,
+}
+
+async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Error> {
+    let url = format!("{BASE_URL}/user-chats?username={}", user_info.username);
+
+    let client = reqwest::Client::new();
+    let res = client.get(url).bearer_auth(&user_info.token).send().await?;
+    let text = res.text().await?;
+    let chats: ChatResponce = serde_json::from_str(&text)
+        .map_err(|e| {
+            println!("JSON parsing error in get_chats: {}", e);
+            panic!("Failed to parse chats JSON");
+        })
+        .unwrap();
+
+    Ok(chats)
 }
