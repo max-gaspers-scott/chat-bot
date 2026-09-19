@@ -62,9 +62,9 @@ async fn main() {
 
             if new.sender_name != user.username {
                 if let Some(text) = &new_text {
-                    let echo = SendMesage {
+                    let echo = SendMessage {
                         sender_name: user.username.clone(),
-                        parent: Some(id),
+                        parent_id: Some(id),
                         content: serde_json::json!({ "text": text }),
                     };
                     match send_message(&user, &echo).await {
@@ -130,10 +130,10 @@ struct Img {
     url: String,
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct SendMesage {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SendMessage {
     pub sender_name: String,
-    pub parent: Option<uuid::Uuid>,
+    pub parent_id: Option<uuid::Uuid>,
     pub content: serde_json::Value,
 }
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -235,7 +235,7 @@ struct PostMsgRes {
 
 async fn send_message(
     login: &LoginPayload,
-    message: &SendMesage,
+    message: &SendMessage,
 ) -> Result<PostMsgRes, reqwest::Error> {
     let url = format!("{BASE_URL}/messages");
     let client = reqwest::Client::new();
@@ -247,7 +247,12 @@ async fn send_message(
         .send()
         .await?;
 
+    // Check if the request itself was successful (e.g., 200 OK)
+    // If you expect specific HTTP error codes for certain backend errors, you can check them here.
+    response.error_for_status_ref()?;
+
     let parsed_res = response.json::<PostMsgRes>().await?;
+
     Ok(parsed_res)
 }
 
