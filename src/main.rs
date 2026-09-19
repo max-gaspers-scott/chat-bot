@@ -17,14 +17,18 @@ async fn main() {
     };
     // ask user to chat name
     let chat_name = cool_cli_input::get_input("what is the name of the chat you want to lisen in");
+    let chat_name = chat_name.trim();
     // gett uuid
 
     // ****************  BAD CODE ****************** //
     let mut id: Option<Uuid> = None;
     for c in chats {
         match c.content {
-            SendibleContent::Text(m) => {
-                id = Some(c.message_id);
+            SendibleContent::Title(m) => {
+                let name = m.title;
+                if name == chat_name {
+                    id = Some(c.message_id);
+                }
             }
             _ => {}
         }
@@ -64,7 +68,7 @@ async fn main() {
                         content: serde_json::json!({ "text": text }),
                     };
                     match send_message(&user, &echo).await {
-                        Ok(res) => println!("echo sent (id: {})", res.data.message_id),
+                        Ok(res) => println!("echo sent (id: {:?})", res.data),
                         Err(e) => println!("failed to send echo: {}", e),
                     }
                 }
@@ -163,6 +167,7 @@ async fn get_message(login: &LoginPayload, chat_id: &Uuid) -> Result<Message, re
         })
         .unwrap();
 
+    let status = message_responce.status;
     let messages = message_responce.payload;
 
     let end_msg = messages.last().unwrap().clone();
