@@ -14,3 +14,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 chrono = { version = "0.4", features = ["serde"] } # For Utc
 cool_cli_input = "0.2.1"
+rig = "0.42.0"
+anyhow = "1.0.104"
+rig-core = "0.42.0"
+dotenv = "0.15.0"
