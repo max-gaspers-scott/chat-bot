@@ -1,7 +1,13 @@
+use anyhow::Context;
 use reqwest::Response;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::{Uuid, uuid};
+
+use dotenv::dotenv;
+use rig::prelude::*;
+use rig_core::{client::CompletionClient, providers::openai};
+use std::{env, result::Result};
 
 #[tokio::main]
 async fn main() {
@@ -53,19 +59,16 @@ async fn main() {
         };
 
         if new_text != last_text {
-            println!("+------------------------+");
-            println!("+                        +");
-            println!("+    mesage was sent     +");
-            println!("+                        +");
-            println!("+------------------------+");
             println!("received: {}", new_text.as_deref().unwrap_or("(non-text)"));
+
+            let ai_response = call_ai(&new_text.clone().unwrap()).await.unwrap();
 
             if new.sender_name != user.username {
                 if let Some(text) = &new_text {
                     let echo = SendMessage {
                         sender_name: user.username.clone(),
                         parent_id: Some(id),
-                        content: serde_json::json!({ "text": text }),
+                        content: serde_json::json!({ "text": ai_response}),
                     };
                     match send_message(&user, &echo).await {
                         Ok(res) => println!("echo sent (id: {:?})", res.data),
@@ -107,7 +110,7 @@ pub struct Message {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub struct MessageResponce {
+pub struct MessageResponse {
     pub payload: Vec<Message>,
     pub status: String,
 }
@@ -160,15 +163,15 @@ async fn get_message(login: &LoginPayload, chat_id: &Uuid) -> Result<Message, re
         .send()
         .await?;
     let text = res.text().await?;
-    let message_responce: MessageResponce = serde_json::from_str(&text)
+    let message_response: MessageResponse = serde_json::from_str(&text)
         .map_err(|e| {
             println!("JSON parsing error in get_messages: {}", e);
             panic!("Failed to parse messages JSON");
         })
         .unwrap();
 
-    let status = message_responce.status;
-    let messages = message_responce.payload;
+    let status = message_response.status;
+    let messages = message_response.payload;
 
     let end_msg = messages.last().unwrap().clone();
 
@@ -276,4 +279,31 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
         .unwrap();
 
     Ok(chats)
+}
+
+async fn call_ai(queisotn: &str) -> Result<String, anyhow::Error> {
+    println!("run ai stuff");
+    dotenv().ok();
+    let api_key_name = "AI_ENG";
+    let api_key: String = match env::var(api_key_name) {
+        Ok(val) => val.trim().to_string(),
+        Err(e) => {
+            println!("couldn't interpret {api_key_name}: {e}");
+            format!("{}", e)
+        }
+    };
+    let client = openai::Client::new(api_key)?;
+
+    // Build an agent: a model plus a system prompt (the "preamble").
+    let agent = client
+        .agent("gpt-3.5-turbo")
+        .preamble("You are a helpful assistant.")
+        .build();
+
+    let response = agent
+        .prompt(queisotn)
+        .await
+        .context("could not get response from model. maybe out of money");
+
+    response
 }
