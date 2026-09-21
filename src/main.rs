@@ -5,6 +5,7 @@ use serde_json::json;
 use uuid::{Uuid, uuid};
 
 use dotenv::dotenv;
+use rig::memory::InMemoryConversationMemory;
 use rig::prelude::*;
 use rig_core::{client::CompletionClient, providers::openai};
 use std::{env, result::Result};
@@ -281,7 +282,7 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
     Ok(chats)
 }
 
-async fn call_ai(queisotn: &str) -> Result<String, anyhow::Error> {
+async fn call_ai(question: &str) -> Result<String, anyhow::Error> {
     println!("run ai stuff");
     dotenv().ok();
     let api_key_name = "AI_ENG";
@@ -294,14 +295,17 @@ async fn call_ai(queisotn: &str) -> Result<String, anyhow::Error> {
     };
     let client = openai::Client::new(api_key)?;
 
+    let memory = InMemoryConversationMemory::new();
+
     // Build an agent: a model plus a system prompt (the "preamble").
     let agent = client
         .agent("gpt-3.5-turbo")
         .preamble("You are a helpful assistant.")
+        .memory(memory)
         .build();
 
     let response = agent
-        .prompt(queisotn)
+        .prompt(question)
         .await
         .context("could not get response from model. maybe out of money");
 
