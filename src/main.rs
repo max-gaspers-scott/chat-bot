@@ -7,7 +7,7 @@ use rig::memory::InMemoryConversationMemory;
 use rig::prelude::*;
 use rig_core::providers::openai;
 use std::{env, result::Result};
-use diffy::{apply_to_string, Patch};
+use diffy::apply_to_string;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
