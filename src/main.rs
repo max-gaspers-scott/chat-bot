@@ -115,9 +115,9 @@ enum LoginInfo {
 #[derive(Debug, serde::Deserialize, Clone)]
 pub struct Message {
     #[serde(default)]
-    pub message_id: uuid::Uuid,
+    pub message_id: Uuid,
     pub sender_name: String,
-    pub parent: Option<uuid::Uuid>,
+    pub parent: Option<Uuid>,
     pub content: SendibleContent,
     #[serde(default)]
     pub sent_at: chrono::DateTime<chrono::Utc>,
@@ -150,7 +150,7 @@ struct Img {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SendMessage {
     pub sender_name: String,
-    pub parent_id: Option<uuid::Uuid>,
+    pub parent_id: Option<Uuid>,
     pub content: serde_json::Value,
 }
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -242,7 +242,7 @@ async fn get_jwt() -> LoginPayload {
 
 #[derive(Deserialize, Debug)]
 struct PostMsgData {
-    message_id: uuid::Uuid,
+    message_id: Uuid,
 }
 
 #[derive(Deserialize, Debug)]
@@ -317,7 +317,8 @@ async fn call_ai(
                 // Generate a thought based on the question and previous observations
                 thought = agent
                     .prompt(&format!(
-                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file.\n\n                        User request: {}\n                        Previous observation: {}\n\n                        What is your next thought and action? Respond in a JSON format with 'thought' and 'action' fields.\n                        The 'action' field should be a call to one of the available tools, or 'None' if you are done.\n                        Example:\n                        {{\"thought\": \"I need to read the file first.\", \"action\": \"read_file('src/main.rs')\"}}\n                        {{\"thought\": \"I have applied the diff and finished the task.\", \"action\": \"None\"}}",
+                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file.\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n\n                        User request: {}\n                        Previous observation: {}\n
+                        What is your next thought and action? Respond in a JSON format with 'thought' and 'action' fields.\n                        The 'action' field should be a call to one of the available tools, or 'None' if you are done.\n                        Example:\n                        {{\"thought\": \"I need to read the file first.\", \"action\": \"read_file('src/main.rs')\"}}\n                        {{\"thought\": \"I have listed the directory.\", \"action\": \"list_dir('.')\"}}\n                        {{\"thought\": \"I have applied the diff and finished the task.\", \"action\": \"None\"}}",
                         question, observation
                     ))
                     .conversation("coding-agent")
@@ -338,14 +339,28 @@ async fn call_ai(
                     let path = action
                         .trim_start_matches("read_file('")
                         .trim_end_matches("')");
-                    observation = read_file(path).await?;
+                    match read_file(path).await {
+                        Ok(content) => observation = content,
+                        Err(e) => observation = format!("Error reading file {}: {}", path, e),
+                    }
                     state = AgentState::Observe;
                 } else if action.starts_with("apply_diff") {
                     let parts: Vec<&str> = action.split("', '").collect();
                     let path = parts[0].trim_start_matches("apply_diff('");
                     let diff = parts[1].trim_end_matches("')");
-                    apply_diff(path, diff).await?;                       
-                    observation = format!("Successfully applied diff to {}", path);
+                    match apply_diff(path, diff).await {
+                        Ok(_) => observation = format!("Successfully applied diff to {}", path),
+                        Err(e) => observation = format!("Error applying diff to {}: {}", path, e),
+                    }
+                    state = AgentState::Observe;
+                } else if action.starts_with("list_dir") {
+                    let path = action
+                        .trim_start_matches("list_dir('")
+                        .trim_end_matches("')");
+                    match list_dir(path).await {
+                        Ok(list) => observation = list,
+                        Err(e) => observation = format!("Error listing directory {}: {}", path, e),
+                    }
                     state = AgentState::Observe;
                 } else {
                     observation = format!("Unknown action: {}", action);
@@ -364,7 +379,6 @@ async fn call_ai(
     }
 }
 
-
 async fn read_file(path: &str) -> Result<String, anyhow::Error> {
     let content = tokio::fs::read_to_string(path)
         .await
@@ -377,7 +391,7 @@ async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
         .await
         .context(format!("Failed to read file for diff: {}", path))?;
     
-    let patch = diffy::Patch::from_str(diff)
+    let patch = Patch::from_str(diff)
         .context("Failed to parse diff string")?;
 
     let patched_content = diffy_apply(&original_content, &patch) 
@@ -387,4 +401,17 @@ async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
         .await
         .context(format!("Failed to write patched file: {}", path))?;
     Ok(())
+}
+
+async fn list_dir(path: &str) -> Result<String, anyhow::Error> {
+    let mut entries = tokio::fs::read_dir(path)
+        .await
+        .context(format!("Failed to read directory: {}", path))?;
+
+    let mut file_list = String::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name();
+        file_list.push_str(&format!("{}\n", file_name.to_string_lossy()));
+    }
+    Ok(file_list)
 }
