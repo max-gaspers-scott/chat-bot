@@ -7,7 +7,7 @@ use rig::memory::InMemoryConversationMemory;
 use rig::prelude::*;
 use rig_core::providers::openai;
 use std::{env, result::Result};
-use diffy;
+use diffy::{apply_to_string, Patch};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -309,6 +309,7 @@ async fn call_ai(
     let mut state = AgentState::Think;
     let mut thought = String::new();
     let mut observation = String::new();
+    let mut parsed_thought: Option<serde_json::Value> = None;
 
     loop {
         match state {
@@ -327,8 +328,9 @@ async fn call_ai(
             }
             AgentState::Act => {
                 // Parse the thought and execute the action
-                let parsed_thought: serde_json::Value = serde_json::from_str(&thought)?;
-                let action = parsed_thought["action"].as_str().unwrap_or("None");
+                let current_thought: serde_json::Value = serde_json::from_str(&thought)?;
+                let action = current_thought["action"].as_str().unwrap_or("None");
+                parsed_thought = Some(current_thought);
 
                 if action == "None" {
                     state = AgentState::Done;
@@ -356,7 +358,7 @@ async fn call_ai(
             }
             AgentState::Done => {
                 // The task is complete
-                return Ok(parsed_thought["thought"].as_str().unwrap_or("Task completed.").to_string());
+                return Ok(parsed_thought.unwrap()["thought"].as_str().unwrap_or("Task completed.").to_string());
             }
         }
     }
