@@ -295,6 +295,73 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
     Ok(chats)
 }
 
+async fn call_ai(
+    question: &str,
+    agent: &mut rig::Agent,
+) -> Result<String, anyhow::Error> {
+    enum AgentState {
+        Think,
+        Act,
+        Observe,
+        Done,
+    }
+
+    let mut state = AgentState::Think;
+    let mut thought = String::new();
+    let mut observation = String::new();
+
+    loop {
+        match state {
+            AgentState::Think => {
+                // Generate a thought based on the question and previous observations
+                thought = agent
+                    .prompt(&format!(
+                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file.\n\n                        User request: {}\n                        Previous observation: {}\n\n                        What is your next thought and action? Respond in a JSON format with 'thought' and 'action' fields.\n                        The 'action' field should be a call to one of the available tools, or 'None' if you are done.\n                        Example:\n                        {{\"thought\": \"I need to read the file first.\", \"action\": \"read_file('src/main.rs')\"}}\n                        {{\"thought\": \"I have applied the diff and finished the task.\", \"action\": \"None\"}}",
+                        question, observation
+                    ))
+                    .conversation("coding-agent")
+                    .await
+                    .context("Failed to get thought from model")?;
+
+                state = AgentState::Act;
+            }
+            AgentState::Act => {
+                // Parse the thought and execute the action
+                let parsed_thought: serde_json::Value = serde_json::from_str(&thought)?;
+                let action = parsed_thought["action"].as_str().unwrap_or("None");
+
+                if action == "None" {
+                    state = AgentState::Done;
+                } else if action.starts_with("read_file") {
+                    let path = action
+                        .trim_start_matches("read_file('")
+                        .trim_end_matches("')");
+                    observation = read_file(path).await?;
+                    state = AgentState::Observe;
+                } else if action.starts_with("apply_diff") {
+                    let parts: Vec<&str> = action.split("', '").collect();
+                    let path = parts[0].trim_start_matches("apply_diff('");
+                    let diff = parts[1].trim_end_matches("')");
+                    apply_diff(path, diff).await?;                       
+                    observation = format!("Successfully applied diff to {}", path);
+                    state = AgentState::Observe;
+                } else {
+                    observation = format!("Unknown action: {}", action);
+                    state = AgentState::Observe;
+                }
+            }
+            AgentState::Observe => {
+                // The observation is already set in the Act state
+                state = AgentState::Think;
+            }
+            AgentState::Done => {
+                // The task is complete
+                return Ok(parsed_thought["thought"].as_str().unwrap_or("Task completed.").to_string());
+            }
+        }
+    }
+}
+
 
 async fn read_file(path: &str) -> Result<String, anyhow::Error> {
     let content = tokio::fs::read_to_string(path)
@@ -316,5 +383,3 @@ async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
         .context(format!("Failed to write patched file: {}", path))?;
     Ok(())
 }
-
-
