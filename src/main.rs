@@ -7,7 +7,7 @@ use rig::memory::InMemoryConversationMemory;
 use rig::prelude::*;
 use rig_core::providers::openai;
 use std::{env, result::Result};
-use diffy::apply_to_string;
+use diffy::apply as diffy_apply;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -377,7 +377,7 @@ async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
         .await
         .context(format!("Failed to read file for diff: {}", path))?;
     
-    let patched_content = diffy::apply_to_string(&original_content, diff)
+    let patched_content = diffy_apply(&original_content, diff)
         .context("Failed to apply diff")?;
 
     tokio::fs::write(path, patched_content)
