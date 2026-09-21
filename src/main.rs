@@ -1,17 +1,16 @@
 use anyhow::Context;
-use reqwest::Response;
 use serde::Deserialize;
-use serde_json::json;
-use uuid::{Uuid, uuid};
+use uuid::Uuid;
 
 use dotenv::dotenv;
 use rig::memory::InMemoryConversationMemory;
 use rig::prelude::*;
-use rig_core::{client::CompletionClient, providers::openai};
+use rig_core::providers::openai;
 use std::{env, result::Result};
+use diffy;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), anyhow::Error> {
     let user = get_jwt().await;
     // let id = uuid!("b4fbbad7-a13c-4dc2-b1f3-9776f6f47e2d");
     // get chats
@@ -30,20 +29,34 @@ async fn main() {
     // ****************  BAD CODE ****************** //
     let mut id: Option<Uuid> = None;
     for c in chats {
-        match c.content {
-            SendibleContent::Title(m) => {
-                let name = m.title;
-                if name == chat_name {
-                    id = Some(c.message_id);
-                }
+        if let SendibleContent::Title(m) = c.content {
+            let name = m.title;
+            if name == chat_name {
+                id = Some(c.message_id);
             }
-            _ => {}
         }
     }
     let id = match id {
         Some(id) => id,
         _ => panic!(),
     };
+
+    dotenv().ok();
+    let api_key_name = "AI_ENG";
+    let api_key: String = match env::var(api_key_name) {
+        Ok(val) => val.trim().to_string(),
+        Err(e) => {
+            println!("couldn't interpret {api_key_name}: {e}");
+            format!("{}", e)
+        }
+    };
+    let client = openai::Client::new(api_key)?;
+    let memory = InMemoryConversationMemory::new();
+    let mut agent = client
+        .agent("gpt-3.5-turbo")
+        .preamble("You are a helpful assistant.")
+        .memory(memory)
+        .build();
 
     let mut last = get_message(&user, &id).await.unwrap();
 
@@ -62,19 +75,19 @@ async fn main() {
         if new_text != last_text {
             println!("received: {}", new_text.as_deref().unwrap_or("(non-text)"));
 
-            let ai_response = call_ai(&new_text.clone().unwrap()).await.unwrap();
+            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent).await.unwrap();
 
-            if new.sender_name != user.username {
-                if let Some(text) = &new_text {
-                    let echo = SendMessage {
-                        sender_name: user.username.clone(),
-                        parent_id: Some(id),
-                        content: serde_json::json!({ "text": ai_response}),
-                    };
-                    match send_message(&user, &echo).await {
-                        Ok(res) => println!("echo sent (id: {:?})", res.data),
-                        Err(e) => println!("failed to send echo: {}", e),
-                    }
+            if new.sender_name != user.username
+                && let Some(_text) = &new_text
+            {
+                let echo = SendMessage {
+                    sender_name: user.username.clone(),
+                    parent_id: Some(id),
+                    content: serde_json::json!({ "text": ai_response}),
+                };
+                match send_message(&user, &echo).await {
+                    Ok(res) => println!("echo sent (id: {:?})", res.data),
+                    Err(e) => println!("failed to send echo: {}", e),
                 }
             }
         }
@@ -171,7 +184,7 @@ async fn get_message(login: &LoginPayload, chat_id: &Uuid) -> Result<Message, re
         })
         .unwrap();
 
-    let status = message_response.status;
+    let _status = message_response.status;
     let messages = message_response.payload;
 
     let end_msg = messages.last().unwrap().clone();
@@ -282,32 +295,26 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
     Ok(chats)
 }
 
-async fn call_ai(question: &str) -> Result<String, anyhow::Error> {
-    println!("run ai stuff");
-    dotenv().ok();
-    let api_key_name = "AI_ENG";
-    let api_key: String = match env::var(api_key_name) {
-        Ok(val) => val.trim().to_string(),
-        Err(e) => {
-            println!("couldn't interpret {api_key_name}: {e}");
-            format!("{}", e)
-        }
-    };
-    let client = openai::Client::new(api_key)?;
 
-    let memory = InMemoryConversationMemory::new();
-
-    // Build an agent: a model plus a system prompt (the "preamble").
-    let agent = client
-        .agent("gpt-3.5-turbo")
-        .preamble("You are a helpful assistant.")
-        .memory(memory)
-        .build();
-
-    let response = agent
-        .prompt(question)
+async fn read_file(path: &str) -> Result<String, anyhow::Error> {
+    let content = tokio::fs::read_to_string(path)
         .await
-        .context("could not get response from model. maybe out of money");
-
-    response
+        .context(format!("Failed to read file: {}", path))?;
+    Ok(content)
 }
+
+async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
+    let original_content = tokio::fs::read_to_string(path)
+        .await
+        .context(format!("Failed to read file for diff: {}", path))?;
+    
+    let patched_content = diffy::apply_to_string(&original_content, diff)
+        .context("Failed to apply diff")?;
+
+    tokio::fs::write(path, patched_content)
+        .await
+        .context(format!("Failed to write patched file: {}", path))?;
+    Ok(())
+}
+
+
