@@ -330,7 +330,7 @@ async fn call_ai(
                 // Parse the thought and execute the action
                 let current_thought: serde_json::Value = serde_json::from_str(&thought)?;
                 let action = current_thought["action"].as_str().unwrap_or("None");
-                parsed_thought = Some(current_thought);
+                parsed_thought = Some(current_thought.clone());
 
                 if action == "None" {
                     state = AgentState::Done;
