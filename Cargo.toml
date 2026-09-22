@@ -4,17 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-
-reqwest = { version = "0.13", features = ["json", "form", "stream"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-
-tokio = { version = "1", features = ["full", "time"] }
-uuid = { version = "1", features = ["serde", "v4"] }
-
-chrono = { version = "0.4", features = ["serde"] } # For Utc
-cool_cli_input = "0.2.1"
-rig = "0.42.0"
 anyhow = "1.0.104"
-rig-core = "0.42.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+cool_cli_input = "0.2.1"
 dotenv = "0.15.0"
+reqwest = { version = "0.13", features = ["json"] }
+rig = "0.42.0"
+rig-core = "0.42.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.115"
+tokio = { version = "1.36.0", features = ["full"] }
+uuid = { version = "1.8.0", features = ["v4", "serde"] }
+diffy = "0.3.0"

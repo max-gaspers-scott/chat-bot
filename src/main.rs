@@ -1,16 +1,16 @@
 use anyhow::Context;
-use reqwest::Response;
 use serde::Deserialize;
-use serde_json::json;
-use uuid::{Uuid, uuid};
+use uuid::Uuid;
 
+use diffy::{Patch, apply as diffy_apply};
 use dotenv::dotenv;
+use rig::memory::InMemoryConversationMemory;
 use rig::prelude::*;
-use rig_core::{client::CompletionClient, providers::openai};
+use rig_core::providers::openai;
 use std::{env, result::Result};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), anyhow::Error> {
     let user = get_jwt().await;
     // let id = uuid!("b4fbbad7-a13c-4dc2-b1f3-9776f6f47e2d");
     // get chats
@@ -29,20 +29,34 @@ async fn main() {
     // ****************  BAD CODE ****************** //
     let mut id: Option<Uuid> = None;
     for c in chats {
-        match c.content {
-            SendibleContent::Title(m) => {
-                let name = m.title;
-                if name == chat_name {
-                    id = Some(c.message_id);
-                }
+        if let SendibleContent::Title(m) = c.content {
+            let name = m.title;
+            if name == chat_name {
+                id = Some(c.message_id);
             }
-            _ => {}
         }
     }
     let id = match id {
         Some(id) => id,
         _ => panic!(),
     };
+
+    dotenv().ok();
+    let api_key_name = "AI_ENG";
+    let api_key: String = match env::var(api_key_name) {
+        Ok(val) => val.trim().to_string(),
+        Err(e) => {
+            println!("couldn't interpret {api_key_name}: {e}");
+            format!("{}", e)
+        }
+    };
+    let client = openai::Client::new(api_key)?;
+    let memory = InMemoryConversationMemory::new();
+    let mut agent = client
+        .agent("gpt-3.5-turbo")
+        .preamble("You are a helpful assistant.")
+        .memory(memory)
+        .build();
 
     let mut last = get_message(&user, &id).await.unwrap();
 
@@ -61,19 +75,21 @@ async fn main() {
         if new_text != last_text {
             println!("received: {}", new_text.as_deref().unwrap_or("(non-text)"));
 
-            let ai_response = call_ai(&new_text.clone().unwrap()).await.unwrap();
+            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent)
+                .await
+                .unwrap();
 
-            if new.sender_name != user.username {
-                if let Some(text) = &new_text {
-                    let echo = SendMessage {
-                        sender_name: user.username.clone(),
-                        parent_id: Some(id),
-                        content: serde_json::json!({ "text": ai_response}),
-                    };
-                    match send_message(&user, &echo).await {
-                        Ok(res) => println!("echo sent (id: {:?})", res.data),
-                        Err(e) => println!("failed to send echo: {}", e),
-                    }
+            if new.sender_name != user.username
+                && let Some(_text) = &new_text
+            {
+                let echo = SendMessage {
+                    sender_name: user.username.clone(),
+                    parent_id: Some(id),
+                    content: serde_json::json!({ "text": ai_response}),
+                };
+                match send_message(&user, &echo).await {
+                    Ok(res) => println!("echo sent (id: {:?})", res.data),
+                    Err(e) => println!("failed to send echo: {}", e),
                 }
             }
         }
@@ -101,9 +117,9 @@ enum LoginInfo {
 #[derive(Debug, serde::Deserialize, Clone)]
 pub struct Message {
     #[serde(default)]
-    pub message_id: uuid::Uuid,
+    pub message_id: Uuid,
     pub sender_name: String,
-    pub parent: Option<uuid::Uuid>,
+    pub parent: Option<Uuid>,
     pub content: SendibleContent,
     #[serde(default)]
     pub sent_at: chrono::DateTime<chrono::Utc>,
@@ -136,7 +152,7 @@ struct Img {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SendMessage {
     pub sender_name: String,
-    pub parent_id: Option<uuid::Uuid>,
+    pub parent_id: Option<Uuid>,
     pub content: serde_json::Value,
 }
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -170,7 +186,7 @@ async fn get_message(login: &LoginPayload, chat_id: &Uuid) -> Result<Message, re
         })
         .unwrap();
 
-    let status = message_response.status;
+    let _status = message_response.status;
     let messages = message_response.payload;
 
     let end_msg = messages.last().unwrap().clone();
@@ -228,7 +244,7 @@ async fn get_jwt() -> LoginPayload {
 
 #[derive(Deserialize, Debug)]
 struct PostMsgData {
-    message_id: uuid::Uuid,
+    message_id: Uuid,
 }
 
 #[derive(Deserialize, Debug)]
@@ -281,29 +297,129 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
     Ok(chats)
 }
 
-async fn call_ai(queisotn: &str) -> Result<String, anyhow::Error> {
-    println!("run ai stuff");
-    dotenv().ok();
-    let api_key_name = "AI_ENG";
-    let api_key: String = match env::var(api_key_name) {
-        Ok(val) => val.trim().to_string(),
-        Err(e) => {
-            println!("couldn't interpret {api_key_name}: {e}");
-            format!("{}", e)
+async fn call_ai(question: &str, agent: &mut rig::Agent) -> Result<String, anyhow::Error> {
+    enum AgentState {
+        Think,
+        Act,
+        Observe,
+        Done,
+    }
+
+    let mut state = AgentState::Think;
+    let mut thought = String::new();
+    let mut observation = String::new();
+    let mut parsed_thought: Option<serde_json::Value> = None;
+
+    loop {
+        match state {
+            AgentState::Think => {
+                // Generate a thought based on the question and previous observations
+                println!("thingking: {}", format!(
+                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file.\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n\n                        User request: {}\n                        Previous observation: {}\n
+                        What is your next thought and action? Respond in a JSON format with 'thought' and 'action' fields.\n                        The 'action' field should be a call to one of the available tools, or 'None' if you are done.\n                        Example:\n                        {{\"thought\": \"I need to read the file first.\", \"action\": \"read_file('src/main.rs')\"}}\n                        {{\"thought\": \"I have listed the directory.\", \"action\": \"list_dir('.')\"}}\n                        {{\"thought\": \"I have applied the diff and finished the task.\", \"action\": \"None\"}}",
+                        question, observation
+                    ));
+                thought = agent
+                    .prompt(&format!(
+                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file.\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n\n                        User request: {}\n                        Previous observation: {}\n
+                        What is your next thought and action? Respond in a JSON format with 'thought' and 'action' fields.\n                        The 'action' field should be a call to one of the available tools, or 'None' if you are done.\n                        Example:\n                        {{\"thought\": \"I need to read the file first.\", \"action\": \"read_file('src/main.rs')\"}}\n                        {{\"thought\": \"I have listed the directory.\", \"action\": \"list_dir('.')\"}}\n                        {{\"thought\": \"I have applied the diff and finished the task.\", \"action\": \"None\"}}",
+                        question, observation
+                    ))
+                    .conversation("coding-agent")
+                    .await
+                    .context("Failed to get thought from model")?;
+
+                state = AgentState::Act;
+            }
+            AgentState::Act => {
+                // Parse the thought and execute the action
+                let current_thought: serde_json::Value = serde_json::from_str(&thought)?;
+                let action = current_thought["action"].as_str().unwrap_or("None");
+                parsed_thought = Some(current_thought.clone());
+
+                if action == "None" {
+                    state = AgentState::Done;
+                } else if action.starts_with("read_file") {
+                    let path = action
+                        .trim_start_matches("read_file('")
+                        .trim_end_matches("')");
+                    match read_file(path).await {
+                        Ok(content) => observation = content,
+                        Err(e) => observation = format!("Error reading file {}: {}", path, e),
+                    }
+                    state = AgentState::Observe;
+                } else if action.starts_with("apply_diff") {
+                    let parts: Vec<&str> = action.split("', '").collect();
+                    let path = parts[0].trim_start_matches("apply_diff('");
+                    let diff = parts[1].trim_end_matches("')");
+                    match apply_diff(path, diff).await {
+                        Ok(_) => observation = format!("Successfully applied diff to {}", path),
+                        Err(e) => observation = format!("Error applying diff to {}: {}", path, e),
+                    }
+                    state = AgentState::Observe;
+                } else if action.starts_with("list_dir") {
+                    let path = action
+                        .trim_start_matches("list_dir('")
+                        .trim_end_matches("')");
+                    match list_dir(path).await {
+                        Ok(list) => observation = list,
+                        Err(e) => observation = format!("Error listing directory {}: {}", path, e),
+                    }
+                    state = AgentState::Observe;
+                } else {
+                    observation = format!("Unknown action: {}", action);
+                    state = AgentState::Observe;
+                }
+            }
+            AgentState::Observe => {
+                // The observation is already set in the Act state
+                state = AgentState::Think;
+            }
+            AgentState::Done => {
+                // The task is complete
+                return Ok(parsed_thought.unwrap()["thought"]
+                    .as_str()
+                    .unwrap_or("Task completed.")
+                    .to_string());
+            }
         }
-    };
-    let client = openai::Client::new(api_key)?;
+    }
+}
 
-    // Build an agent: a model plus a system prompt (the "preamble").
-    let agent = client
-        .agent("gpt-3.5-turbo")
-        .preamble("You are a helpful assistant.")
-        .build();
-
-    let response = agent
-        .prompt(queisotn)
+async fn read_file(path: &str) -> Result<String, anyhow::Error> {
+    println!("readign file");
+    let content = tokio::fs::read_to_string(path)
         .await
-        .context("could not get response from model. maybe out of money");
+        .context(format!("Failed to read file: {}", path))?;
+    Ok(content)
+}
 
-    response
+async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
+    println!("applying diff");
+    let original_content = tokio::fs::read_to_string(path)
+        .await
+        .context(format!("Failed to read file for diff: {}", path))?;
+
+    let patch = Patch::from_str(diff).context("Failed to parse diff string")?;
+
+    let patched_content = diffy_apply(&original_content, &patch).context("Failed to apply diff")?;
+
+    tokio::fs::write(path, patched_content)
+        .await
+        .context(format!("Failed to write patched file: {}", path))?;
+    Ok(())
+}
+
+async fn list_dir(path: &str) -> Result<String, anyhow::Error> {
+    println!("list dirs");
+    let mut entries = tokio::fs::read_dir(path)
+        .await
+        .context(format!("Failed to read directory: {}", path))?;
+
+    let mut file_list = String::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name();
+        file_list.push_str(&format!("{}\n", file_name.to_string_lossy()));
+    }
+    Ok(file_list)
 }
