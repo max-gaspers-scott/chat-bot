@@ -2,12 +2,12 @@ use anyhow::Context;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use diffy::{Patch, apply as diffy_apply};
 use dotenv::dotenv;
 use rig::memory::InMemoryConversationMemory;
 use rig::prelude::*;
 use rig_core::providers::openai;
 use std::{env, result::Result};
-use diffy::{apply as diffy_apply, Patch};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -75,7 +75,9 @@ async fn main() -> Result<(), anyhow::Error> {
         if new_text != last_text {
             println!("received: {}", new_text.as_deref().unwrap_or("(non-text)"));
 
-            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent).await.unwrap();
+            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent)
+                .await
+                .unwrap();
 
             if new.sender_name != user.username
                 && let Some(_text) = &new_text
@@ -295,10 +297,7 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
     Ok(chats)
 }
 
-async fn call_ai(
-    question: &str,
-    agent: &mut rig::Agent,
-) -> Result<String, anyhow::Error> {
+async fn call_ai(question: &str, agent: &mut rig::Agent) -> Result<String, anyhow::Error> {
     enum AgentState {
         Think,
         Act,
@@ -315,6 +314,11 @@ async fn call_ai(
         match state {
             AgentState::Think => {
                 // Generate a thought based on the question and previous observations
+                println!("thingking: {}", format!(
+                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file.\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n\n                        User request: {}\n                        Previous observation: {}\n
+                        What is your next thought and action? Respond in a JSON format with 'thought' and 'action' fields.\n                        The 'action' field should be a call to one of the available tools, or 'None' if you are done.\n                        Example:\n                        {{\"thought\": \"I need to read the file first.\", \"action\": \"read_file('src/main.rs')\"}}\n                        {{\"thought\": \"I have listed the directory.\", \"action\": \"list_dir('.')\"}}\n                        {{\"thought\": \"I have applied the diff and finished the task.\", \"action\": \"None\"}}",
+                        question, observation
+                    ));
                 thought = agent
                     .prompt(&format!(
                         "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file.\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n\n                        User request: {}\n                        Previous observation: {}\n
@@ -373,13 +377,17 @@ async fn call_ai(
             }
             AgentState::Done => {
                 // The task is complete
-                return Ok(parsed_thought.unwrap()["thought"].as_str().unwrap_or("Task completed.").to_string());
+                return Ok(parsed_thought.unwrap()["thought"]
+                    .as_str()
+                    .unwrap_or("Task completed.")
+                    .to_string());
             }
         }
     }
 }
 
 async fn read_file(path: &str) -> Result<String, anyhow::Error> {
+    println!("readign file");
     let content = tokio::fs::read_to_string(path)
         .await
         .context(format!("Failed to read file: {}", path))?;
@@ -387,15 +395,14 @@ async fn read_file(path: &str) -> Result<String, anyhow::Error> {
 }
 
 async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
+    println!("applying diff");
     let original_content = tokio::fs::read_to_string(path)
         .await
         .context(format!("Failed to read file for diff: {}", path))?;
-    
-    let patch = Patch::from_str(diff)
-        .context("Failed to parse diff string")?;
 
-    let patched_content = diffy_apply(&original_content, &patch) 
-        .context("Failed to apply diff")?;
+    let patch = Patch::from_str(diff).context("Failed to parse diff string")?;
+
+    let patched_content = diffy_apply(&original_content, &patch).context("Failed to apply diff")?;
 
     tokio::fs::write(path, patched_content)
         .await
@@ -404,6 +411,7 @@ async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
 }
 
 async fn list_dir(path: &str) -> Result<String, anyhow::Error> {
+    println!("list dirs");
     let mut entries = tokio::fs::read_dir(path)
         .await
         .context(format!("Failed to read directory: {}", path))?;
