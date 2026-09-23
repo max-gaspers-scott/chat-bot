@@ -330,7 +330,7 @@ async fn call_ai(
             }
             AgentState::Act => {
                 // Parse the thought and execute the action
-                let current_thought: serde_json::Value = serde_json::from_str(&thought)?; // No need to clone here anymore, will clone to `parsed_thought` below
+                let current_thought: serde_json::Value = serde_json::from_str(&thought)?;
                 let action = current_thought["action"].as_str().unwrap_or("None");
                 parsed_thought = Some(current_thought.clone());
 
@@ -397,6 +397,9 @@ async fn read_file(path: &str) -> Result<String, anyhow::Error> {
 }
 
 async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
+    eprintln!("Applying diff to path: {}", path);
+    eprintln!("Received diff content:\n{}", diff);
+
     let original_content = tokio::fs::read_to_string(path)
         .await
         .context(format!("Failed to read file for diff: {}", path))?;
@@ -406,6 +409,8 @@ async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
 
     let patched_content = diffy_apply(&original_content, &patch) 
         .context("Failed to apply diff")?;
+
+    eprintln!("Patched content generated:\n{}", patched_content); 
 
     tokio::fs::write(path, patched_content)
         .await
