@@ -351,8 +351,12 @@ async fn call_ai(
                 } else if action.starts_with("apply_diff") {
                     let parts: Vec<&str> = action.split("', '").collect();
                     let path = parts[0].trim_start_matches("apply_diff('");
-                    let diff = parts[1].trim_end_matches("')");
-                    match apply_diff(path, diff).await {
+                    let raw_diff = parts[1].trim_end_matches("')");
+
+                    // Unescape newline characters in the diff string
+                    let diff = raw_diff.replace("\\n", "\n");
+
+                    match apply_diff(path, &diff).await {
                         Ok(_) => observation = format!("Successfully applied diff to {}", path),
                         Err(e) => {
                             eprintln!("Error executing apply_diff for {}: {:?}", path, e);
