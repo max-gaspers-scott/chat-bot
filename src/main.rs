@@ -317,7 +317,7 @@ async fn call_ai(
                 // Generate a thought based on the question and previous observations
                 thought = agent
                     .prompt(&format!(
-                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file.\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n
+                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file. The `diff` argument MUST be in the unified diff format.\n                        Example of a unified diff to add a line at the beginning of a file:\n                        ```diff\n                        --- a/file.rs\n                        +++ b/file.rs\n                        @@ -0,0 +1,1 @@\n                        +new line\n                        ```\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n
                         Original User Request: {}\n                        Last Action Result: {}\n
                         What is your next thought and action? Respond in a JSON format with 'thought' and 'action' fields.\n                        The 'action' field should be a call to one of the available tools, or 'None' if you are done.\n                        Example:\n                        {{\"thought\": \"I need to read the file first.\", \"action\": \"read_file('src/main.rs')\"}}\n                        {{\"thought\": \"I have listed the directory.\", \"action\": \"list_dir('.')\"}}\n                        {{\"thought\": \"I have applied the diff and finished the task.\", \"action\": \"None\"}}",
                         question, observation
@@ -330,7 +330,7 @@ async fn call_ai(
             }
             AgentState::Act => {
                 // Parse the thought and execute the action
-                let current_thought: serde_json::Value = serde_json::from_str(&thought)?;
+                let current_thought: serde_json::Value = serde_json::from_str(&thought)?; // No need to clone here anymore, will clone to `parsed_thought` below
                 let action = current_thought["action"].as_str().unwrap_or("None");
                 parsed_thought = Some(current_thought.clone());
 
