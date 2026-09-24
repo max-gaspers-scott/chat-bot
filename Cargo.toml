@@ -16,3 +16,4 @@ serde_json = "1.0.115"
 tokio = { version = "1.36.0", features = ["full"] }
 uuid = { version = "1.8.0", features = ["v4", "serde"] }
 diffy = "0.3.0"
+rig-mcp = "0.2.5"

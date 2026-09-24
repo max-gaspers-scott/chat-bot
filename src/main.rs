@@ -2,12 +2,15 @@ use anyhow::Context;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use diffy::{Patch, apply as diffy_apply};
 use dotenv::dotenv;
 use rig::memory::InMemoryConversationMemory;
 use rig::prelude::*;
 use rig_core::providers::openai;
 use std::{env, result::Result};
-use diffy::{apply as diffy_apply, Patch};
+
+use rig_compose::{LocalTool, ToolRegistry, ToolSchema};
+use rig_mcp::{LoopbackTransport, McpTool, McpTransport};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -75,7 +78,9 @@ async fn main() -> Result<(), anyhow::Error> {
         if new_text != last_text {
             println!("received: {}", new_text.as_deref().unwrap_or("(non-text)"));
 
-            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent).await.unwrap();
+            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent)
+                .await
+                .unwrap();
 
             if new.sender_name != user.username
                 && let Some(_text) = &new_text
@@ -295,10 +300,7 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
     Ok(chats)
 }
 
-async fn call_ai(
-    question: &str,
-    agent: &mut rig::Agent,
-) -> Result<String, anyhow::Error> {
+async fn call_ai(question: &str, agent: &mut rig::Agent) -> Result<String, anyhow::Error> {
     enum AgentState {
         Think,
         Act,
@@ -344,7 +346,10 @@ async fn call_ai(
                         Ok(content) => observation = content,
                         Err(e) => {
                             eprintln!("Error executing read_file for {}: {:?}", path, e);
-                            observation = format!("Failed to read file {}. Error details logged to stderr.", path);
+                            observation = format!(
+                                "Failed to read file {}. Error details logged to stderr.",
+                                path
+                            );
                         }
                     }
                     state = AgentState::Observe;
@@ -360,7 +365,10 @@ async fn call_ai(
                         Ok(_) => observation = format!("Successfully applied diff to {}", path),
                         Err(e) => {
                             eprintln!("Error executing apply_diff for {}: {:?}", path, e);
-                            observation = format!("Failed to apply diff to {}. Error details logged to stderr.", path);
+                            observation = format!(
+                                "Failed to apply diff to {}. Error details logged to stderr.",
+                                path
+                            );
                         }
                     }
                     state = AgentState::Observe;
@@ -372,7 +380,10 @@ async fn call_ai(
                         Ok(list) => observation = list,
                         Err(e) => {
                             eprintln!("Error executing list_dir for {}: {:?}", path, e);
-                            observation = format!("Failed to list directory {}. Error details logged to stderr.", path);
+                            observation = format!(
+                                "Failed to list directory {}. Error details logged to stderr.",
+                                path
+                            );
                         }
                     }
                     state = AgentState::Observe;
@@ -387,7 +398,10 @@ async fn call_ai(
             }
             AgentState::Done => {
                 // The task is complete
-                return Ok(parsed_thought.unwrap()["thought"].as_str().unwrap_or("Task completed.").to_string());
+                return Ok(parsed_thought.unwrap()["thought"]
+                    .as_str()
+                    .unwrap_or("Task completed.")
+                    .to_string());
             }
         }
     }
@@ -407,14 +421,12 @@ async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
     let original_content = tokio::fs::read_to_string(path)
         .await
         .context(format!("Failed to read file for diff: {}", path))?;
-    
-    let patch = Patch::from_str(diff)
-        .context("Failed to parse diff string")?;
 
-    let patched_content = diffy_apply(&original_content, &patch) 
-        .context("Failed to apply diff")?;
+    let patch = Patch::from_str(diff).context("Failed to parse diff string")?;
 
-    eprintln!("Patched content generated:\n{}", patched_content); 
+    let patched_content = diffy_apply(&original_content, &patch).context("Failed to apply diff")?;
+
+    eprintln!("Patched content generated:\n{}", patched_content);
 
     tokio::fs::write(path, patched_content)
         .await
