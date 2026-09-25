@@ -1,13 +1,17 @@
+// This project is licensed under Apache 2.0
 use anyhow::Context;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use diffy::{Patch, apply as diffy_apply};
 use dotenv::dotenv;
 use rig::memory::InMemoryConversationMemory;
 use rig::prelude::*;
 use rig_core::providers::openai;
 use std::{env, result::Result};
-use diffy::{apply as diffy_apply, Patch};
+
+// use rig_compose::{LocalTool, ToolRegistry, ToolSchema};
+use rig_mcp::{LoopbackTransport, McpTool, McpTransport};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -75,7 +79,9 @@ async fn main() -> Result<(), anyhow::Error> {
         if new_text != last_text {
             println!("received: {}", new_text.as_deref().unwrap_or("(non-text)"));
 
-            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent).await.unwrap();
+            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent)
+                .await
+                .unwrap();
 
             if new.sender_name != user.username
                 && let Some(_text) = &new_text
@@ -295,10 +301,7 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
     Ok(chats)
 }
 
-async fn call_ai(
-    question: &str,
-    agent: &mut rig::Agent,
-) -> Result<String, anyhow::Error> {
+async fn call_ai(question: &str, agent: &mut rig::Agent) -> Result<String, anyhow::Error> {
     enum AgentState {
         Think,
         Act,
@@ -310,87 +313,179 @@ async fn call_ai(
     let mut thought = String::new();
     let mut observation = String::new();
     let mut parsed_thought: Option<serde_json::Value> = None;
+    let max_iterations = 10;
+    let mut iteration = 0;
+    let mut last_action = String::new();
 
     loop {
+        iteration += 1;
+        if iteration > max_iterations {
+            eprintln!("MAX ITERATIONS REACHED");
+            return Ok(format!(
+                "Max iterations ({}) reached. Last thought: {}",
+                max_iterations, thought
+            ));
+        }
+
         match state {
             AgentState::Think => {
+                eprintln!("[Think] Iteration {}, generating thought...", iteration);
                 // Generate a thought based on the question and previous observations
                 thought = agent
                     .prompt(&format!(
-                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file. The `diff` argument MUST be in the unified diff format.\n                        Example of a unified diff to add a line at the beginning of a file:\n                        ```diff\n                        --- a/file.rs\n                        +++ b/file.rs\n                        @@ -0,0 +1,1 @@\n                        +new line\n                        ```\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n
+                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file. The `diff` argument MUST be in the unified diff format.\n                        Example of a unified diff to add a line at the beginning of a file:\n                        ```diff\n                        --- a/file.rs\n                        +++ b/file.rs\n                        @@ -0,0 +1,1 @@\n                        +new line\n                        ```\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n                        - `run_bash(command: &str)`: Runs a bash command and returns its output. Use this for commands like `tree`, `ls`, `grep`, etc.\n
                         Original User Request: {}\n                        Last Action Result: {}\n
+                        Last Action: {}\n
+                        IMPORTANT: Do NOT repeat the same action multiple times. If you get the same result twice, try a different approach or conclude the task.\n
                         What is your next thought and action? Respond in a JSON format with 'thought' and 'action' fields.\n                        The 'action' field should be a call to one of the available tools, or 'None' if you are done.\n                        Example:\n                        {{\"thought\": \"I need to read the file first.\", \"action\": \"read_file('src/main.rs')\"}}\n                        {{\"thought\": \"I have listed the directory.\", \"action\": \"list_dir('.')\"}}\n                        {{\"thought\": \"I have applied the diff and finished the task.\", \"action\": \"None\"}}",
-                        question, observation
+                        question, observation, last_action
                     ))
                     .conversation("coding-agent")
                     .await
                     .context("Failed to get thought from model")?;
 
+                eprintln!("RAW AI RESPONSE: {}", thought);
+
                 state = AgentState::Act;
             }
             AgentState::Act => {
+                eprintln!("[Act] Iteration {}, parsing action...", iteration);
                 // Parse the thought and execute the action
-                let current_thought: serde_json::Value = serde_json::from_str(&thought)?; // No need to clone here anymore, will clone to `parsed_thought` below
+                let current_thought: serde_json::Value = match serde_json::from_str(&thought) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("PARSE ERROR: {}", e);
+                        eprintln!("RAW THOUGHT THAT FAILED TO PARSE: {}", thought);
+                        observation = format!("JSON parse error: {}. Please respond with valid JSON.", e);
+                        state = AgentState::Observe;
+                        continue;
+                    }
+                };
                 let action = current_thought["action"].as_str().unwrap_or("None");
+                eprintln!("ACTION: '{}'", action);
+                eprintln!("THOUGHT: '{}'", current_thought["thought"].as_str().unwrap_or("(missing thought field)"));
                 parsed_thought = Some(current_thought.clone());
 
                 if action == "None" {
+                    eprintln!("Agent signaled Done");
                     state = AgentState::Done;
                 } else if action.starts_with("read_file") {
-                    let path = action
-                        .trim_start_matches("read_file('")
-                        .trim_end_matches("')");
+                    let after_prefix = action.strip_prefix("read_file('").unwrap_or(action);
+                    let path = after_prefix.strip_suffix("')").unwrap_or(after_prefix);
+                    eprintln!("Executing read_file: {}", path);
                     match read_file(path).await {
-                        Ok(content) => observation = content,
+                        Ok(content) => {
+                            eprintln!("read_file succeeded, content length: {}", content.len());
+                            observation = content;
+                        }
                         Err(e) => {
                             eprintln!("Error executing read_file for {}: {:?}", path, e);
-                            observation = format!("Failed to read file {}. Error details logged to stderr.", path);
+                            observation = format!("Failed to read file {}: {:?}", path, e);
                         }
                     }
+                    last_action = action.to_string();
                     state = AgentState::Observe;
                 } else if action.starts_with("apply_diff") {
-                    let parts: Vec<&str> = action.split("', '").collect();
-                    let path = parts[0].trim_start_matches("apply_diff('");
-                    let raw_diff = parts[1].trim_end_matches("')");
+                    let parts: Vec<&str> = action.splitn(2, "', '").collect();
+                    if parts.len() < 2 {
+                        observation = format!("Invalid apply_diff action format: {}", action);
+                    } else {
+                        let path = parts[0].strip_prefix("apply_diff('").unwrap_or(parts[0]);
+                        let raw_diff = parts[1].strip_suffix("')").unwrap_or(parts[1]);
 
-                    // Unescape newline characters in the diff string
-                    let diff = raw_diff.replace("\\n", "\n");
+                        let mut diff = raw_diff.replace("\\n", "\n");
+                        if !diff.ends_with('\n') {
+                            diff.push('\n');
+                        }
 
-                    match apply_diff(path, &diff).await {
-                        Ok(_) => observation = format!("Successfully applied diff to {}", path),
-                        Err(e) => {
-                            eprintln!("Error executing apply_diff for {}: {:?}", path, e);
-                            observation = format!("Failed to apply diff to {}. Error details logged to stderr.", path);
+                        eprintln!("Executing apply_diff: {}", path);
+                        match apply_diff(path, &diff).await {
+                            Ok(_) => {
+                                eprintln!("apply_diff succeeded");
+                                observation = format!("Successfully applied diff to {}", path);
+                            }
+                            Err(e) => {
+                                eprintln!("Error executing apply_diff for {}: {:?}", path, e);
+                                observation = format!("Failed to apply diff to {}: {:?}", path, e);
+                            }
                         }
                     }
+                    last_action = action.to_string();
                     state = AgentState::Observe;
                 } else if action.starts_with("list_dir") {
-                    let path = action
-                        .trim_start_matches("list_dir('")
-                        .trim_end_matches("')");
+                    let after_prefix = action.strip_prefix("list_dir('").unwrap_or(action);
+                    let path = after_prefix.strip_suffix("')").unwrap_or(after_prefix);
+                    eprintln!("Executing list_dir: {}", path);
                     match list_dir(path).await {
-                        Ok(list) => observation = list,
+                        Ok(list) => {
+                            eprintln!("list_dir succeeded, entries: {}", list.lines().count());
+                            observation = list;
+                        }
                         Err(e) => {
                             eprintln!("Error executing list_dir for {}: {:?}", path, e);
-                            observation = format!("Failed to list directory {}. Error details logged to stderr.", path);
+                            observation = format!("Failed to list directory {}: {:?}", path, e);
                         }
                     }
+                    last_action = action.to_string();
+                    state = AgentState::Observe;
+                } else if action.starts_with("run_bash") {
+                    let after_prefix = action.strip_prefix("run_bash('").unwrap_or(action);
+                    let command = after_prefix.strip_suffix("')").unwrap_or(after_prefix);
+                    eprintln!("Executing run_bash: {}", command);
+                    match run_bash(command).await {
+                        Ok(output) => {
+                            eprintln!("run_bash succeeded, output length: {}", output.len());
+                            observation = output;
+                        }
+                        Err(e) => {
+                            eprintln!("Error executing run_bash for {}: {:?}", command, e);
+                            observation = format!("Failed to run bash command '{}': {:?}", command, e);
+                        }
+                    }
+                    last_action = action.to_string();
                     state = AgentState::Observe;
                 } else {
+                    eprintln!("Unknown action: {}", action);
                     observation = format!("Unknown action: {}", action);
                     state = AgentState::Observe;
                 }
             }
             AgentState::Observe => {
+                eprintln!("[Observe] Iteration {}, observation set, going to Think", iteration);
                 // The observation is already set in the Act state
                 state = AgentState::Think;
             }
             AgentState::Done => {
+                eprintln!("Agent signaled Done, returning");
                 // The task is complete
-                return Ok(parsed_thought.unwrap()["thought"].as_str().unwrap_or("Task completed.").to_string());
+                return Ok(parsed_thought.unwrap()["thought"]
+                    .as_str()
+                    .unwrap_or("Task completed.")
+                    .to_string());
             }
         }
     }
+}
+
+async fn run_bash(command: &str) -> Result<String, anyhow::Error> {
+    use std::process::Command;
+    
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .context(format!("Failed to execute bash command: {}", command))?;
+    
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    
+    let result = if !stderr.is_empty() {
+        format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr)
+    } else {
+        stdout
+    };
+    
+    Ok(result)
 }
 
 async fn read_file(path: &str) -> Result<String, anyhow::Error> {
@@ -407,14 +502,12 @@ async fn apply_diff(path: &str, diff: &str) -> Result<(), anyhow::Error> {
     let original_content = tokio::fs::read_to_string(path)
         .await
         .context(format!("Failed to read file for diff: {}", path))?;
-    
-    let patch = Patch::from_str(diff)
-        .context("Failed to parse diff string")?;
 
-    let patched_content = diffy_apply(&original_content, &patch) 
-        .context("Failed to apply diff")?;
+    let patch = Patch::from_str(diff).context("Failed to parse diff string")?;
 
-    eprintln!("Patched content generated:\n{}", patched_content); 
+    let patched_content = diffy_apply(&original_content, &patch).context("Failed to apply diff")?;
+
+    eprintln!("Patched content generated:\n{}", patched_content);
 
     tokio::fs::write(path, patched_content)
         .await
