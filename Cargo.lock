@@ -802,6 +802,7 @@ dependencies = [
  "dotenv",
  "reqwest 0.13.5",
  "rig",
+ "rig-compose",
  "rig-core",
  "rig-mcp",
  "serde",
