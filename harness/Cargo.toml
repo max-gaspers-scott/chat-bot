@@ -10,6 +10,7 @@ rig-reqwest.workspace = true
 rig-http.workspace    = true
 
 tokio.workspace       = true
+tokio-util.workspace  = true
 reqwest.workspace     = true
 serde.workspace       = true
 serde_json.workspace  = true
@@ -22,5 +23,7 @@ http.workspace        = true
 
 [dev-dependencies]
 rig           = { version = "0.43.0", default-features = false, features = ["reqwest", "agent"] }
+rig-core      = { version = "0.43.0", default-features = false, features = ["reqwest", "test-utils"] }
 jsonwebtoken  = { version = "9.3.1" }
 tokio         = { version = "1.44.2", features = ["full", "test-util"] }
+tempfile      = { version = "3.20.0" }

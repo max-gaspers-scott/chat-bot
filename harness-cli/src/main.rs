@@ -1,17 +1,23 @@
 //! `harness-cli` — minimal CLI for testing the harness library.
 //!
-//! Provides: signup, login, chat (hello-world completion), whoami, logout.
+//! Provides: signup, login, chat (hello-world completion), run (agent loop),
+//! whoami, logout.
 //! Not intended as the final UX — real TUI/web UIs come later.
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use harness::agent_loop::{LoopConfig, TaskOutcome, run_task};
 use harness::client::{ClientBuilder, LoginCredentials};
+use harness::events::HarnessEvent;
+use harness::memory::{InMemoryConversation, Memory};
 use rig::AgentBuilder;
 use serde::Serialize;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 const MODEL: &str = "gemini-2.5-flash";
 const PREAMBLE: &str = "You are a helpful assistant.";
@@ -63,6 +69,20 @@ enum Commands {
     Chat {
         /// The message to send (joined with spaces if multiple args)
         message: Vec<String>,
+    },
+    /// Run the Phase-2 agent loop against the real proxy (requires login first)
+    Run {
+        /// The task to send (joined with spaces if multiple args)
+        task: Vec<String>,
+        /// Maximum model turns before giving up
+        #[arg(long, default_value_t = 20)]
+        max_turns: usize,
+        /// System prompt override
+        #[arg(long)]
+        system: Option<String>,
+        /// Write a JSONL transcript to this directory
+        #[arg(long)]
+        transcript_dir: Option<PathBuf>,
     },
     /// Show the currently saved token path
     Whoami,
@@ -241,6 +261,232 @@ async fn handle_chat(api_url: &str, message: Vec<String>) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared client builder from saved token
+// ---------------------------------------------------------------------------
+
+fn build_transport(
+    api_url: &str,
+    token: &str,
+) -> (harness::client::HarnessHttpClient, Arc<tokio::sync::RwLock<harness::client::TokenState>>) {
+    use harness::client::TokenState;
+    use std::time::{Duration, Instant};
+    use tokio::sync::RwLock;
+
+    let store = Arc::new(RwLock::new(TokenState {
+        token: token.to_string(),
+        expires_at: Instant::now() + Duration::from_secs(24 * 3600),
+    }));
+
+    let refresher = harness::client::TokenRefresher::new_for_existing_token(api_url.to_string());
+    let transport = harness::client::HarnessHttpClient::from_parts(Arc::clone(&store), refresher);
+    (transport, store)
+}
+
+// ---------------------------------------------------------------------------
+// handle_run — drives the Phase-2 agent loop in an interactive REPL
+// ---------------------------------------------------------------------------
+
+async fn handle_run(
+    api_url: &str,
+    task: Vec<String>,
+    max_turns: usize,
+    system: Option<String>,
+    transcript_dir: Option<PathBuf>,
+) -> Result<()> {
+    let token = load_token()?;
+    let (transport, _store) = build_transport(api_url, &token);
+    let rig_client = harness::client::mira_openai_client(api_url, transport);
+
+    // Erase to DynModel<Completion> — what run_task expects.
+    use rig_core::operation::Completion;
+    let model: rig_core::DynModel<Completion> = rig_client.chat(MODEL).erase();
+
+    // Shared memory across all turns — this is what we're testing.
+    let mut memory = InMemoryConversation::new();
+
+    let session_id = format!(
+        "cli-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+
+    let config = LoopConfig {
+        max_turns,
+        system_prompt: system.or_else(|| Some(PREAMBLE.to_string())),
+        transcript_dir,
+        session_id,
+        model_id: Some(MODEL.to_string()),
+        ..LoopConfig::default()
+    };
+
+    // Get the first message from the CLI args, or drop into the REPL immediately.
+    let first = if task.is_empty() { None } else { Some(task.join(" ")) };
+
+    eprintln!("Interactive agent loop. Type your message and press Enter.");
+    eprintln!("Commands: :quit or :q to exit, :history to show memory, :clear to wipe memory.");
+    eprintln!("─────────────────────────────────────────────────────────");
+
+    let mut turn_number: usize = 0;
+
+    loop {
+        // Read input: use CLI arg on the very first iteration, then prompt.
+        let text = if turn_number == 0 {
+            if let Some(first_msg) = first.clone() {
+                eprintln!("You: {first_msg}");
+                first_msg
+            } else {
+                read_line("You: ")?
+            }
+        } else {
+            read_line("You: ")?
+        };
+
+        // Handle REPL commands.
+        match text.trim() {
+            ":quit" | ":q" | "" => {
+                eprintln!("Bye.");
+                break;
+            }
+            ":history" => {
+                let history = memory.load();
+                if history.is_empty() {
+                    eprintln!("[history is empty]");
+                } else {
+                    eprintln!("[history — {} messages]", history.len());
+                    for (i, msg) in history.iter().enumerate() {
+                        let role = match msg {
+                            harness::memory::Message::User { .. } => "user     ",
+                            harness::memory::Message::Assistant { .. } => "assistant",
+                            harness::memory::Message::System { .. } => "system   ",
+                        };
+                        eprintln!("  [{i}] {role}: {}", msg_text(msg));
+                    }
+                }
+                continue;
+            }
+            ":clear" => {
+                memory.replace(vec![]);
+                eprintln!("[memory cleared]");
+                continue;
+            }
+            _ => {}
+        }
+
+        turn_number += 1;
+        eprint!("Gemini: ");
+        io::stdout().flush()?;
+
+        // Fresh channel and cancel token for each user turn.
+        let (tx, mut rx) = mpsc::channel::<HarnessEvent>(64);
+        let cancel = CancellationToken::new();
+
+        // Print events inline as they arrive.
+        let printer = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    HarnessEvent::TextDelta { delta } => {
+                        print!("{delta}");
+                        let _ = io::stdout().flush();
+                    }
+                    HarnessEvent::ToolCallStarted { name, arguments, .. } => {
+                        eprintln!("\n  [tool →] {name}({arguments})");
+                    }
+                    HarnessEvent::ToolCallFinished { name, output, .. } => {
+                        eprintln!("  [tool ←] {name}: {output}");
+                        eprint!("Gemini: ");
+                        let _ = io::stdout().flush();
+                    }
+                    HarnessEvent::ApprovalRequested { name, preview, .. } => {
+                        eprintln!("\n  [approval needed] {name}\n  {preview}");
+                    }
+                    HarnessEvent::TurnFinished { .. }
+                    | HarnessEvent::TaskComplete { .. } => {}
+                    HarnessEvent::MaxTurnsReached { max_turns } => {
+                        eprintln!("\n[max turns ({max_turns}) reached]");
+                    }
+                    HarnessEvent::Cancelled => {
+                        eprintln!("\n[cancelled]");
+                    }
+                    HarnessEvent::Error { message, fatal } => {
+                        eprintln!(
+                            "\n[error{f}] {message}",
+                            f = if fatal { " (fatal)" } else { "" }
+                        );
+                    }
+                }
+            }
+        });
+
+        let outcome = run_task(&model, text, &mut memory, &tx, cancel, &config).await;
+
+        drop(tx);
+        let _ = printer.await;
+        println!(); // newline after the model's response
+
+        match outcome {
+            Ok(TaskOutcome::Completed { .. }) => {}
+            Ok(TaskOutcome::MaxTurnsReached) => {
+                eprintln!("[max turns reached — memory has {} messages]", memory.load().len());
+            }
+            Ok(TaskOutcome::Cancelled) => {
+                eprintln!("[cancelled]");
+            }
+            Err(e) => {
+                eprintln!("[error] {e:#}");
+                // Don't exit — let the user try again or inspect history.
+            }
+        }
+
+        eprintln!(
+            "  (memory: {} messages)",
+            memory.load().len()
+        );
+        eprintln!("─────────────────────────────────────────────────────────");
+    }
+
+    Ok(())
+}
+
+/// Print `prompt` and read a line from stdin.
+fn read_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    Ok(buf.trim().to_string())
+}
+
+/// Extract the first text content from a message for display.
+fn msg_text(msg: &harness::memory::Message) -> String {
+    use harness::memory::Message;
+    match msg {
+        Message::System { content } => content.chars().take(80).collect(),
+        Message::User { content } => content
+            .iter()
+            .find_map(|c| {
+                if let harness::memory::UserContent::Text(t) = c {
+                    Some(t.text.chars().take(80).collect())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "[non-text]".into()),
+        Message::Assistant { content, .. } => content
+            .iter()
+            .find_map(|c| {
+                if let harness::memory::AssistantContent::Text(t) = c {
+                    Some(t.text.chars().take(80).collect())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "[tool call]".into()),
+    }
+}
+
 async fn handle_whoami() -> Result<()> {
     let path = token_path()?;
     if path.exists() {
@@ -271,6 +517,9 @@ async fn main() {
         }
         Commands::Login { email, password } => handle_login(&cli.api_url, email, password).await,
         Commands::Chat { message } => handle_chat(&cli.api_url, message).await,
+        Commands::Run { task, max_turns, system, transcript_dir } => {
+            handle_run(&cli.api_url, task, max_turns, system, transcript_dir).await
+        }
         Commands::Whoami => handle_whoami().await,
         Commands::Logout => handle_logout().await,
     };
