@@ -1,0 +1,24 @@
+[package]
+name        = "harness-cli"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+
+[[bin]]
+name = "harness-cli"
+path = "src/main.rs"
+
+[dependencies]
+harness     = { path = "../harness" }
+
+rig.workspace         = true
+rig-core.workspace    = true
+
+tokio.workspace       = true
+serde.workspace       = true
+serde_json.workspace  = true
+anyhow.workspace      = true
+tracing.workspace     = true
+clap.workspace        = true
+dirs.workspace        = true
+reqwest.workspace     = true
