@@ -1,24 +1,74 @@
 // This project is licensed under Apache 2.0
 use anyhow::Context;
+use rig::providers::gemini::completion::gemini_api_types;
+use rig::providers::openai::{OpenAICompatibleProvider, OpenAIRequestParams, OpenAIResponsesExt};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use uuid::Uuid;
 
+use core::panic;
 use diffy::{Patch, apply as diffy_apply};
 use dotenv::dotenv;
 use rig::memory::InMemoryConversationMemory;
-use rig::prelude::*;
-use rig_core::providers::openai;
-use std::{env, result::Result};
 
-// use rig_compose::{LocalTool, ToolRegistry, ToolSchema};
+use rig::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
+use rig::{prelude::*, providers};
+use rig_compose::{KernelError, LocalTool, ToolRegistry, ToolSchema};
+use rig_core::providers::openai;
 use rig_mcp::{LoopbackTransport, McpTool, McpTransport};
+use std::{env, result::Result, sync::Arc};
 
 #[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+async fn main() {
     let user = get_jwt().await;
     // let id = uuid!("b4fbbad7-a13c-4dc2-b1f3-9776f6f47e2d");
-    // get chats
-    let chats = get_chats(&user).await.unwrap();
+    // getget_chatid chats
+    let id = get_chat_id(&user).await;
+
+    let agent = setup_agent().await;
+    let fn_with_agent_stat = async |txt| -> String { call_ai(txt, &agent).await.unwrap() };
+    chat_loop(&user, &id, |txt| {
+        let agent = &agent;
+        async move { call_ai(&txt, agent).await.unwrap() }
+    })
+    .await
+    .unwrap();
+}
+
+async fn setup_agent() -> rig::Agent {
+    dotenv().ok();
+
+    let api_key_name = "AI_ENG";
+    let api_key: String = match env::var(api_key_name) {
+        Ok(val) => val.trim().to_string(),
+        Err(e) => {
+            println!("couldn't interpret {api_key_name}: {e}");
+            format!("{}", e)
+        }
+    };
+    let client = openai::Client::new(api_key).expect("no api key! add one to env");
+    let memory = InMemoryConversationMemory::new();
+    let mcp_tools = setup_mcp_tools().await.expect("failed to set up MCP tools");
+    let mut agent = client
+        .agent("gpt-3.5-turbo")
+        .preamble(
+            "You are a helpful assistant with access to tools that can read and edit files, \
+             list directories, and execute bash commands. Use these tools to help the user \
+             with their requests.",
+        )
+        .dynamic_tools(mcp_tools)
+        .memory(memory)
+        .build();
+    agent
+}
+
+// async fn chat_loop(f: fn(str) -> str) -> Result<(), anyhow::Error> {todo()!}
+
+async fn get_chat_id(user: &LoginPayload) -> uuid::Uuid {
+    let chats = get_chats(user).await.unwrap();
+
     let chats = if chats.status == "success" {
         chats.payload
     } else {
@@ -40,32 +90,30 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
     }
-    let id = match id {
+    match id {
         Some(id) => id,
-        _ => panic!(),
-    };
-
-    dotenv().ok();
-    let api_key_name = "AI_ENG";
-    let api_key: String = match env::var(api_key_name) {
-        Ok(val) => val.trim().to_string(),
-        Err(e) => {
-            println!("couldn't interpret {api_key_name}: {e}");
-            format!("{}", e)
+        _ => {
+            println!("error happend");
+            panic!();
+            // get_chat_id(user).await
         }
-    };
-    let client = openai::Client::new(api_key)?;
-    let memory = InMemoryConversationMemory::new();
-    let mut agent = client
-        .agent("gpt-3.5-turbo")
-        .preamble("You are a helpful assistant.")
-        .memory(memory)
-        .build();
+    }
+}
+
+async fn chat_loop<F, Fut>(
+    user: &LoginPayload,
+    id: &Uuid,
+    response_fn: F,
+) -> Result<(), anyhow::Error>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = String>,
+{
+    let agent = setup_agent().await;
 
     let mut last = get_message(&user, &id).await.unwrap();
-
     loop {
-        let new = get_message(&user, &id).await.unwrap();
+        let new = get_message(user, id).await.unwrap();
 
         let new_text = match &new.content {
             SendibleContent::Text(t) => Some(t.text.clone()),
@@ -77,19 +125,20 @@ async fn main() -> Result<(), anyhow::Error> {
         };
 
         if new_text != last_text {
-            println!("received: {}", new_text.as_deref().unwrap_or("(non-text)"));
-
-            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent)
-                .await
-                .unwrap();
+            println!(
+                "1, received: {}",
+                new_text.as_deref().unwrap_or("(non-text)")
+            );
 
             if new.sender_name != user.username
                 && let Some(_text) = &new_text
             {
+                //&new_text.clone().unwrap()
+                let response = response_fn(new_text.clone().unwrap()).await;
                 let echo = SendMessage {
                     sender_name: user.username.clone(),
-                    parent_id: Some(id),
-                    content: serde_json::json!({ "text": ai_response}),
+                    parent_id: Some(*id), //TODO: scary code, should chage
+                    content: serde_json::json!({ "text": response}),
                 };
                 match send_message(&user, &echo).await {
                     Ok(res) => println!("echo sent (id: {:?})", res.data),
@@ -291,200 +340,189 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
     let client = reqwest::Client::new();
     let res = client.get(url).bearer_auth(&user_info.token).send().await?;
     let text = res.text().await?;
-    let chats: ChatResponce = serde_json::from_str(&text)
-        .map_err(|e| {
-            println!("JSON parsing error in get_chats: {}", e);
-            panic!("Failed to parse chats JSON");
-        })
-        .unwrap();
+    let chats: ChatResponce = serde_json::from_str(&text).unwrap_or_else(|e| {
+        print!("error: {e}");
+        panic!();
+    });
 
     Ok(chats)
 }
 
-async fn call_ai(question: &str, agent: &mut rig::Agent) -> Result<String, anyhow::Error> {
-    enum AgentState {
-        Think,
-        Act,
-        Observe,
-        Done,
+async fn call_ai(question: &str, agent: &rig::Agent) -> Result<String, anyhow::Error> {
+    let response = agent.prompt(question).max_turns(10).await?;
+    Ok(response)
+}
+
+async fn setup_mcp_tools() -> Result<Vec<DynamicTool>, anyhow::Error> {
+    let registry = ToolRegistry::new();
+
+    registry.register(Arc::new(LocalTool::new(
+        ToolSchema {
+            name: "run_bash".into(),
+            description: "Execute a bash command and return the combined stdout/stderr output."
+                .into(),
+            args_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The bash command to execute"
+                    }
+                },
+                "required": ["command"]
+            }),
+            result_schema: serde_json::json!({"type": "string"}),
+        },
+        |args| async move {
+            let command = args
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    KernelError::InvalidArgument("run_bash requires 'command'".into())
+                })?;
+            let output = run_bash(command)
+                .await
+                .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
+            Ok(serde_json::json!(output))
+        },
+    )));
+
+    registry.register(Arc::new(LocalTool::new(
+        ToolSchema {
+            name: "read_file".into(),
+            description: "Read and return the contents of a file at the given path.".into(),
+            args_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file path to read"
+                    }
+                },
+                "required": ["path"]
+            }),
+            result_schema: serde_json::json!({"type": "string"}),
+        },
+        |args| async move {
+            let path = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| KernelError::InvalidArgument("read_file requires 'path'".into()))?;
+            let content = read_file(path)
+                .await
+                .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
+            Ok(serde_json::json!(content))
+        },
+    )));
+
+    registry.register(Arc::new(LocalTool::new(
+        ToolSchema {
+            name: "apply_diff".into(),
+            description: "Apply a unified diff to a file at the given path.".into(),
+            args_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file path to modify"
+                    },
+                    "diff": {
+                        "type": "string",
+                        "description": "The unified diff to apply"
+                    }
+                },
+                "required": ["path", "diff"]
+            }),
+            result_schema: serde_json::Value::Null,
+        },
+        |args| async move {
+            let path = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| KernelError::InvalidArgument("apply_diff requires 'path'".into()))?;
+            let diff = args
+                .get("diff")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| KernelError::InvalidArgument("apply_diff requires 'diff'".into()))?;
+            apply_diff(path, diff)
+                .await
+                .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
+            Ok(serde_json::Value::Null)
+        },
+    )));
+
+    registry.register(Arc::new(LocalTool::new(
+        ToolSchema {
+            name: "list_dir".into(),
+            description: "List the contents of a directory at the given path.".into(),
+            args_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The directory path to list"
+                    }
+                },
+                "required": ["path"]
+            }),
+            result_schema: serde_json::json!({"type": "string"}),
+        },
+        |args| async move {
+            let path = args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| KernelError::InvalidArgument("list_dir requires 'path'".into()))?;
+            let entries = list_dir(path)
+                .await
+                .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
+            Ok(serde_json::json!(entries))
+        },
+    )));
+
+    let transport: Arc<dyn McpTransport> =
+        Arc::new(LoopbackTransport::new("loopback://local-tools", registry));
+
+    let mcp_tools = McpTool::from_transport(transport).await?;
+
+    let mut tools = Vec::new();
+    for mcp_tool in mcp_tools {
+        let schema = mcp_tool.schema();
+        tools.push(DynamicTool::new(
+            schema.name,
+            schema.description,
+            schema.args_schema,
+            move |_ctx: &mut ToolContext, args: serde_json::Value| {
+                let tool = mcp_tool.clone();
+                Box::pin(async move {
+                    match tool.invoke(args).await {
+                        Ok(value) => Ok(ToolOutput::json(value)),
+                        Err(e) => Err(ToolExecutionError::provider(format!("{}", e))),
+                    }
+                })
+            },
+        ));
     }
-
-    let mut state = AgentState::Think;
-    let mut thought = String::new();
-    let mut observation = String::new();
-    let mut parsed_thought: Option<serde_json::Value> = None;
-    let max_iterations = 10;
-    let mut iteration = 0;
-    let mut last_action = String::new();
-
-    loop {
-        iteration += 1;
-        if iteration > max_iterations {
-            eprintln!("MAX ITERATIONS REACHED");
-            return Ok(format!(
-                "Max iterations ({}) reached. Last thought: {}",
-                max_iterations, thought
-            ));
-        }
-
-        match state {
-            AgentState::Think => {
-                eprintln!("[Think] Iteration {}, generating thought...", iteration);
-                // Generate a thought based on the question and previous observations
-                thought = agent
-                    .prompt(&format!(
-                        "You are a coding agent. Your goal is to make changes to code based on user requests.\n                        You have the following tools available:\n                        - `read_file(path: &str)`: Reads the content of a file.\n                        - `apply_diff(path: &str, diff: &str)`: Applies a diff to a file. The `diff` argument MUST be in the unified diff format.\n                        Example of a unified diff to add a line at the beginning of a file:\n                        ```diff\n                        --- a/file.rs\n                        +++ b/file.rs\n                        @@ -0,0 +1,1 @@\n                        +new line\n                        ```\n                        - `list_dir(path: &str)`: Lists the contents of a directory.\n                        - `run_bash(command: &str)`: Runs a bash command and returns its output. Use this for commands like `tree`, `ls`, `grep`, etc.\n
-                        Original User Request: {}\n                        Last Action Result: {}\n
-                        Last Action: {}\n
-                        IMPORTANT: Do NOT repeat the same action multiple times. If you get the same result twice, try a different approach or conclude the task.\n
-                        What is your next thought and action? Respond in a JSON format with 'thought' and 'action' fields.\n                        The 'action' field should be a call to one of the available tools, or 'None' if you are done.\n                        Example:\n                        {{\"thought\": \"I need to read the file first.\", \"action\": \"read_file('src/main.rs')\"}}\n                        {{\"thought\": \"I have listed the directory.\", \"action\": \"list_dir('.')\"}}\n                        {{\"thought\": \"I have applied the diff and finished the task.\", \"action\": \"None\"}}",
-                        question, observation, last_action
-                    ))
-                    .conversation("coding-agent")
-                    .await
-                    .context("Failed to get thought from model")?;
-
-                eprintln!("RAW AI RESPONSE: {}", thought);
-
-                state = AgentState::Act;
-            }
-            AgentState::Act => {
-                eprintln!("[Act] Iteration {}, parsing action...", iteration);
-                // Parse the thought and execute the action
-                let current_thought: serde_json::Value = match serde_json::from_str(&thought) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("PARSE ERROR: {}", e);
-                        eprintln!("RAW THOUGHT THAT FAILED TO PARSE: {}", thought);
-                        observation = format!("JSON parse error: {}. Please respond with valid JSON.", e);
-                        state = AgentState::Observe;
-                        continue;
-                    }
-                };
-                let action = current_thought["action"].as_str().unwrap_or("None");
-                eprintln!("ACTION: '{}'", action);
-                eprintln!("THOUGHT: '{}'", current_thought["thought"].as_str().unwrap_or("(missing thought field)"));
-                parsed_thought = Some(current_thought.clone());
-
-                if action == "None" {
-                    eprintln!("Agent signaled Done");
-                    state = AgentState::Done;
-                } else if action.starts_with("read_file") {
-                    let after_prefix = action.strip_prefix("read_file('").unwrap_or(action);
-                    let path = after_prefix.strip_suffix("')").unwrap_or(after_prefix);
-                    eprintln!("Executing read_file: {}", path);
-                    match read_file(path).await {
-                        Ok(content) => {
-                            eprintln!("read_file succeeded, content length: {}", content.len());
-                            observation = content;
-                        }
-                        Err(e) => {
-                            eprintln!("Error executing read_file for {}: {:?}", path, e);
-                            observation = format!("Failed to read file {}: {:?}", path, e);
-                        }
-                    }
-                    last_action = action.to_string();
-                    state = AgentState::Observe;
-                } else if action.starts_with("apply_diff") {
-                    let parts: Vec<&str> = action.splitn(2, "', '").collect();
-                    if parts.len() < 2 {
-                        observation = format!("Invalid apply_diff action format: {}", action);
-                    } else {
-                        let path = parts[0].strip_prefix("apply_diff('").unwrap_or(parts[0]);
-                        let raw_diff = parts[1].strip_suffix("')").unwrap_or(parts[1]);
-
-                        let mut diff = raw_diff.replace("\\n", "\n");
-                        if !diff.ends_with('\n') {
-                            diff.push('\n');
-                        }
-
-                        eprintln!("Executing apply_diff: {}", path);
-                        match apply_diff(path, &diff).await {
-                            Ok(_) => {
-                                eprintln!("apply_diff succeeded");
-                                observation = format!("Successfully applied diff to {}", path);
-                            }
-                            Err(e) => {
-                                eprintln!("Error executing apply_diff for {}: {:?}", path, e);
-                                observation = format!("Failed to apply diff to {}: {:?}", path, e);
-                            }
-                        }
-                    }
-                    last_action = action.to_string();
-                    state = AgentState::Observe;
-                } else if action.starts_with("list_dir") {
-                    let after_prefix = action.strip_prefix("list_dir('").unwrap_or(action);
-                    let path = after_prefix.strip_suffix("')").unwrap_or(after_prefix);
-                    eprintln!("Executing list_dir: {}", path);
-                    match list_dir(path).await {
-                        Ok(list) => {
-                            eprintln!("list_dir succeeded, entries: {}", list.lines().count());
-                            observation = list;
-                        }
-                        Err(e) => {
-                            eprintln!("Error executing list_dir for {}: {:?}", path, e);
-                            observation = format!("Failed to list directory {}: {:?}", path, e);
-                        }
-                    }
-                    last_action = action.to_string();
-                    state = AgentState::Observe;
-                } else if action.starts_with("run_bash") {
-                    let after_prefix = action.strip_prefix("run_bash('").unwrap_or(action);
-                    let command = after_prefix.strip_suffix("')").unwrap_or(after_prefix);
-                    eprintln!("Executing run_bash: {}", command);
-                    match run_bash(command).await {
-                        Ok(output) => {
-                            eprintln!("run_bash succeeded, output length: {}", output.len());
-                            observation = output;
-                        }
-                        Err(e) => {
-                            eprintln!("Error executing run_bash for {}: {:?}", command, e);
-                            observation = format!("Failed to run bash command '{}': {:?}", command, e);
-                        }
-                    }
-                    last_action = action.to_string();
-                    state = AgentState::Observe;
-                } else {
-                    eprintln!("Unknown action: {}", action);
-                    observation = format!("Unknown action: {}", action);
-                    state = AgentState::Observe;
-                }
-            }
-            AgentState::Observe => {
-                eprintln!("[Observe] Iteration {}, observation set, going to Think", iteration);
-                // The observation is already set in the Act state
-                state = AgentState::Think;
-            }
-            AgentState::Done => {
-                eprintln!("Agent signaled Done, returning");
-                // The task is complete
-                return Ok(parsed_thought.unwrap()["thought"]
-                    .as_str()
-                    .unwrap_or("Task completed.")
-                    .to_string());
-            }
-        }
-    }
+    Ok(tools)
 }
 
 async fn run_bash(command: &str) -> Result<String, anyhow::Error> {
     use std::process::Command;
-    
+
     let output = Command::new("bash")
         .arg("-c")
         .arg(command)
         .output()
         .context(format!("Failed to execute bash command: {}", command))?;
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    
+
     let result = if !stderr.is_empty() {
         format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr)
     } else {
         stdout
     };
-    
+
     Ok(result)
 }
 
