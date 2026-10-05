@@ -1,26 +1,45 @@
 // This project is licensed under Apache 2.0
 use anyhow::Context;
+use rig::providers::gemini::completion::gemini_api_types;
+use rig::providers::openai::{OpenAICompatibleProvider, OpenAIRequestParams, OpenAIResponsesExt};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use uuid::Uuid;
 
+use core::panic;
 use diffy::{Patch, apply as diffy_apply};
 use dotenv::dotenv;
 use rig::memory::InMemoryConversationMemory;
-use rig::prelude::*;
+
 use rig::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
+use rig::{prelude::*, providers};
 use rig_compose::{KernelError, LocalTool, ToolRegistry, ToolSchema};
 use rig_core::providers::openai;
 use rig_mcp::{LoopbackTransport, McpTool, McpTransport};
 use std::{env, result::Result, sync::Arc};
 
 #[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+async fn main() {
     let user = get_jwt().await;
     // let id = uuid!("b4fbbad7-a13c-4dc2-b1f3-9776f6f47e2d");
     // getget_chatid chats
-    let id = get_chatid(&user).await;
+    let id = get_chat_id(&user).await;
 
+    let agent = setup_agent().await;
+    let fn_with_agent_stat = async |txt| -> String { call_ai(txt, &agent).await.unwrap() };
+    chat_loop(&user, &id, |txt| {
+        let agent = &agent;
+        async move { call_ai(&txt, agent).await.unwrap() }
+    })
+    .await
+    .unwrap();
+}
+
+async fn setup_agent() -> rig::Agent {
     dotenv().ok();
+
     let api_key_name = "AI_ENG";
     let api_key: String = match env::var(api_key_name) {
         Ok(val) => val.trim().to_string(),
@@ -29,7 +48,7 @@ async fn main() -> Result<(), anyhow::Error> {
             format!("{}", e)
         }
     };
-    let client = openai::Client::new(api_key)?;
+    let client = openai::Client::new(api_key).expect("no api key! add one to env");
     let memory = InMemoryConversationMemory::new();
     let mcp_tools = setup_mcp_tools().await.expect("failed to set up MCP tools");
     let mut agent = client
@@ -42,15 +61,14 @@ async fn main() -> Result<(), anyhow::Error> {
         .dynamic_tools(mcp_tools)
         .memory(memory)
         .build();
-
-    // let fn_with_agent_stat = |txt| txt
-    chat_loop(&user, &id).await
+    agent
 }
 
 // async fn chat_loop(f: fn(str) -> str) -> Result<(), anyhow::Error> {todo()!}
 
-async fn get_chatid(user: &LoginPayload) -> uuid::Uuid {
+async fn get_chat_id(user: &LoginPayload) -> uuid::Uuid {
     let chats = get_chats(user).await.unwrap();
+
     let chats = if chats.status == "success" {
         chats.payload
     } else {
@@ -74,11 +92,25 @@ async fn get_chatid(user: &LoginPayload) -> uuid::Uuid {
     }
     match id {
         Some(id) => id,
-        _ => panic!(),
+        _ => {
+            println!("error happend");
+            panic!();
+            // get_chat_id(user).await
+        }
     }
 }
 
-async fn chat_loop(user: &LoginPayload, id: &Uuid) -> Result<(), anyhow::Error> {
+async fn chat_loop<F, Fut>(
+    user: &LoginPayload,
+    id: &Uuid,
+    response_fn: F,
+) -> Result<(), anyhow::Error>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = String>,
+{
+    let agent = setup_agent().await;
+
     let mut last = get_message(&user, &id).await.unwrap();
     loop {
         let new = get_message(user, id).await.unwrap();
@@ -93,19 +125,20 @@ async fn chat_loop(user: &LoginPayload, id: &Uuid) -> Result<(), anyhow::Error> 
         };
 
         if new_text != last_text {
-            println!("received: {}", new_text.as_deref().unwrap_or("(non-text)"));
-
-            let ai_response = call_ai(&new_text.clone().unwrap(), &mut agent)
-                .await
-                .unwrap();
+            println!(
+                "1, received: {}",
+                new_text.as_deref().unwrap_or("(non-text)")
+            );
 
             if new.sender_name != user.username
                 && let Some(_text) = &new_text
             {
+                //&new_text.clone().unwrap()
+                let response = response_fn(new_text.clone().unwrap()).await;
                 let echo = SendMessage {
                     sender_name: user.username.clone(),
                     parent_id: Some(*id), //TODO: scary code, should chage
-                    content: serde_json::json!({ "text": ai_response}),
+                    content: serde_json::json!({ "text": response}),
                 };
                 match send_message(&user, &echo).await {
                     Ok(res) => println!("echo sent (id: {:?})", res.data),
@@ -307,17 +340,15 @@ async fn get_chats(user_info: &LoginPayload) -> Result<ChatResponce, reqwest::Er
     let client = reqwest::Client::new();
     let res = client.get(url).bearer_auth(&user_info.token).send().await?;
     let text = res.text().await?;
-    let chats: ChatResponce = serde_json::from_str(&text)
-        .map_err(|e| {
-            println!("JSON parsing error in get_chats: {}", e);
-            panic!("Failed to parse chats JSON");
-        })
-        .unwrap();
+    let chats: ChatResponce = serde_json::from_str(&text).unwrap_or_else(|e| {
+        print!("error: {e}");
+        panic!();
+    });
 
     Ok(chats)
 }
 
-async fn call_ai(question: &str, agent: &mut rig::Agent) -> Result<String, anyhow::Error> {
+async fn call_ai(question: &str, agent: &rig::Agent) -> Result<String, anyhow::Error> {
     let response = agent.prompt(question).max_turns(10).await?;
     Ok(response)
 }
