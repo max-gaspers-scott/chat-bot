@@ -37,6 +37,39 @@ async fn main() {
     .unwrap();
 }
 
+// unlike ai, the other use may take a long time to send back a message if they send one back at
+// all. but ai could take a long time to and the user may want to send more than one message back to
+// back. i should rethink the architiecutl. maybe chat_loop should be two runcitons, one that waits
+// for this user to send a message and sends it with the paased on fn and another loop that waits
+// for the other client d9eather ai or email or whatever) to send a message back and and the new
+// message to the chat?
+//
+// this idea would work for email but not for the ai. for the responce to come the proces needs to
+// stay alaive, it cant be fire and forget
+// unless i make a wraper for the ai that files it and then adds the res to teh chat when its down.
+//
+// ^ that jsut moves the problem. it dosent realy change anything and is not worth the complexity
+// probaby
+async fn mail(message: &String) -> Result<String, anyhow::Error> {
+    let email = Message::builder()
+        .from("you@example.com")
+        .to("recipient@example.com")
+        .subject("Subject")
+        .body("Hello from Rust!")
+        .unwrap();
+
+    let creds = Credentials::new("smtp_username", "smtp_password");
+    let mailer = SmtpTransport::relay("smtp.mailserver.com")
+        .unwrap()
+        .credentials(creds)
+        .build();
+
+    match mailer.send(&email) {
+        Ok(_) => println!("Email sent successfully!"),
+        Err(e) => eprintln!("Failed to send email: {:?}", e),
+    }
+}
+
 async fn setup_agent() -> rig::Agent {
     dotenv().ok();
 
