@@ -21,6 +21,15 @@ tracing.workspace     = true
 bytes.workspace       = true
 http.workspace        = true
 
+# tools
+hanzo-apply-patch.workspace = true
+grep-searcher.workspace     = true
+grep-regex.workspace        = true
+command-group.workspace     = true
+globset.workspace           = true
+ignore.workspace            = true
+similar.workspace           = true
+
 [dev-dependencies]
 rig           = { version = "0.43.0", default-features = false, features = ["reqwest", "agent"] }
 rig-core      = { version = "0.43.0", default-features = false, features = ["reqwest", "test-utils"] }

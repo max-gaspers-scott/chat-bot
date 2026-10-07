@@ -22,13 +22,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use rig_core::completion::message::{
-    ToolResult, ToolResultContent,
-};
+use rig_core::DynModel;
+use rig_core::completion::message::{ToolResult, ToolResultContent};
 use rig_core::completion::{CompletionRequest, ToolDefinition};
 use rig_core::message::Message;
 use rig_core::operation::Completion;
-use rig_core::DynModel;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -107,7 +105,9 @@ impl Default for LoopConfig {
         use crate::events::auto_approve;
         Self {
             max_turns: 50,
-            system_prompt: None,
+            system_prompt: Some(String::from(
+                "you are a coding ai. you can use tools to reead, write and edit files in the project you are in for the user",
+            )),
             tools: Vec::new(),
             approval: auto_approve(),
             transcript_dir: None,
@@ -189,11 +189,8 @@ pub async fn run_task(
 
         // ── Build the completion request ─────────────────────────────────
         let history = memory.load();
-        let tool_defs: Vec<ToolDefinition> = config
-            .tools
-            .iter()
-            .map(|t| t.definition.clone())
-            .collect();
+        let tool_defs: Vec<ToolDefinition> =
+            config.tools.iter().map(|t| t.definition.clone()).collect();
 
         // The last message in history is the prompt; everything before it
         // is the conversation context.
@@ -249,7 +246,9 @@ pub async fn run_task(
 
         // Emit text deltas (full turn text as one event for non-streaming).
         if !text.is_empty() {
-            let ev = HarnessEvent::TextDelta { delta: text.clone() };
+            let ev = HarnessEvent::TextDelta {
+                delta: text.clone(),
+            };
             send_event(events, ev.clone()).await;
             log_event(&transcript, &ev).await;
         }
@@ -261,7 +260,9 @@ pub async fn run_task(
 
         // ── If no tool calls, we're done ──────────────────────────────────
         if tool_calls.is_empty() {
-            let ev = HarnessEvent::TaskComplete { output: text.clone() };
+            let ev = HarnessEvent::TaskComplete {
+                output: text.clone(),
+            };
             send_event(events, ev.clone()).await;
             log_event(&transcript, &ev).await;
             return Ok(TaskOutcome::Completed { output: text });
@@ -299,8 +300,7 @@ pub async fn run_task(
                 None => format!("Error: unknown tool `{name}`"),
                 Some(entry) => {
                     // Approval check.
-                    let needs_approval =
-                        entry.requires_approval && !always_allowed.contains(&name);
+                    let needs_approval = entry.requires_approval && !always_allowed.contains(&name);
 
                     if needs_approval {
                         let preview = format!("Tool: {name}\nArgs: {args}");
@@ -348,7 +348,12 @@ pub async fn run_task(
             send_event(events, finished_ev.clone()).await;
             log_event(&transcript, &finished_ev).await;
 
-            tool_results.push(call.result(vec![ToolResultContent::text(result_text)]));
+            // Wrap the output in a JSON object. Gemini (via OpenRouter) parses
+            // tool-result text as JSON when it can, so raw output containing
+            // e.g. `{}` reached the model as an empty result and it reported
+            // the file as missing. An explicit object is always passed through.
+            let wrapped = serde_json::json!({ "output": result_text }).to_string();
+            tool_results.push(call.result(vec![ToolResultContent::text(wrapped)]));
         }
 
         // Append the tool results as a user message (never split from the
@@ -417,7 +422,10 @@ mod tests {
         let model = MockCompletionModel::from_turns([MockTurn::text("hello world")]).erase();
         let (tx, rx) = mpsc::channel(32);
         let mut mem = InMemoryConversation::new();
-        let config = LoopConfig { max_turns: 5, ..LoopConfig::default() };
+        let config = LoopConfig {
+            max_turns: 5,
+            ..LoopConfig::default()
+        };
 
         let outcome = run_task(&model, "hi", &mut mem, &tx, no_cancel(), &config)
             .await
@@ -425,7 +433,9 @@ mod tests {
 
         assert_eq!(
             outcome,
-            TaskOutcome::Completed { output: "hello world".into() }
+            TaskOutcome::Completed {
+                output: "hello world".into()
+            }
         );
 
         // Memory should have user + assistant messages.
@@ -473,11 +483,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, TaskOutcome::Completed { output: "pong".into() });
+        assert_eq!(
+            outcome,
+            TaskOutcome::Completed {
+                output: "pong".into()
+            }
+        );
 
         let events = collect_events(rx).await;
-        let started = events.iter().any(|e| matches!(e, HarnessEvent::ToolCallStarted { name, .. } if name == "echo"));
-        let finished = events.iter().any(|e| matches!(e, HarnessEvent::ToolCallFinished { name, .. } if name == "echo"));
+        let started = events
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::ToolCallStarted { name, .. } if name == "echo"));
+        let finished = events
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::ToolCallFinished { name, .. } if name == "echo"));
         assert!(started, "expected ToolCallStarted");
         assert!(finished, "expected ToolCallFinished");
     }
@@ -514,7 +533,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, TaskOutcome::Completed { output: "done".into() });
+        assert_eq!(
+            outcome,
+            TaskOutcome::Completed {
+                output: "done".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -550,12 +574,17 @@ mod tests {
             .unwrap();
 
         // Loop should continue after denial (model gets "Tool call denied").
-        assert_eq!(outcome, TaskOutcome::Completed { output: "ok".into() });
+        assert_eq!(
+            outcome,
+            TaskOutcome::Completed {
+                output: "ok".into()
+            }
+        );
 
         let events = collect_events(rx).await;
-        let denied = events.iter().any(|e| {
-            matches!(e, HarnessEvent::ApprovalRequested { name, .. } if name == "dangerous")
-        });
+        let denied = events.iter().any(
+            |e| matches!(e, HarnessEvent::ApprovalRequested { name, .. } if name == "dangerous"),
+        );
         assert!(denied, "expected ApprovalRequested event");
     }
 
@@ -592,9 +621,11 @@ mod tests {
         assert_eq!(outcome, TaskOutcome::MaxTurnsReached);
 
         let events = collect_events(rx).await;
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, HarnessEvent::MaxTurnsReached { max_turns: 2 })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::MaxTurnsReached { max_turns: 2 }))
+        );
     }
 
     #[tokio::test]
@@ -605,7 +636,10 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel(); // already cancelled before the loop starts
 
-        let config = LoopConfig { max_turns: 5, ..LoopConfig::default() };
+        let config = LoopConfig {
+            max_turns: 5,
+            ..LoopConfig::default()
+        };
 
         let outcome = run_task(&model, "hi", &mut mem, &tx, cancel, &config)
             .await

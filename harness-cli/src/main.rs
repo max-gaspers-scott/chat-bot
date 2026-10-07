@@ -10,6 +10,7 @@ use harness::agent_loop::{LoopConfig, TaskOutcome, run_task};
 use harness::client::{ClientBuilder, LoginCredentials};
 use harness::events::HarnessEvent;
 use harness::memory::{InMemoryConversation, Memory};
+use harness::tools::all_tools;
 use rig::AgentBuilder;
 use serde::Serialize;
 use std::fs;
@@ -83,6 +84,9 @@ enum Commands {
         /// Write a JSONL transcript to this directory
         #[arg(long)]
         transcript_dir: Option<PathBuf>,
+        /// Workspace root directory (tools are restricted to this path)
+        #[arg(short, long, default_value = ".")]
+        workspace: PathBuf,
     },
     /// Show the currently saved token path
     Whoami,
@@ -293,6 +297,7 @@ async fn handle_run(
     max_turns: usize,
     system: Option<String>,
     transcript_dir: Option<PathBuf>,
+    workspace: PathBuf,
 ) -> Result<()> {
     let token = load_token()?;
     let (transport, _store) = build_transport(api_url, &token);
@@ -313,12 +318,17 @@ async fn handle_run(
             .as_secs()
     );
 
+    // Resolve workspace to absolute path
+    let workspace_root = std::fs::canonicalize(&workspace)
+        .with_context(|| format!("could not resolve workspace path: {}", workspace.display()))?;
+
     let config = LoopConfig {
         max_turns,
         system_prompt: system.or_else(|| Some(PREAMBLE.to_string())),
         transcript_dir,
         session_id,
         model_id: Some(MODEL.to_string()),
+        tools: all_tools(workspace_root),
         ..LoopConfig::default()
     };
 
@@ -517,8 +527,8 @@ async fn main() {
         }
         Commands::Login { email, password } => handle_login(&cli.api_url, email, password).await,
         Commands::Chat { message } => handle_chat(&cli.api_url, message).await,
-        Commands::Run { task, max_turns, system, transcript_dir } => {
-            handle_run(&cli.api_url, task, max_turns, system, transcript_dir).await
+        Commands::Run { task, max_turns, system, transcript_dir, workspace } => {
+            handle_run(&cli.api_url, task, max_turns, system, transcript_dir, workspace).await
         }
         Commands::Whoami => handle_whoami().await,
         Commands::Logout => handle_logout().await,

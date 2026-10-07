@@ -8,3 +8,4 @@ pub mod memory;
 pub mod events;
 pub mod transcript;
 pub mod agent_loop;
+pub mod tools;

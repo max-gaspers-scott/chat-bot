@@ -330,6 +330,55 @@ impl HarnessHttpClient {
             Some(s) if s.as_u16() == 429 || s.is_server_error()
         )
     }
+
+    /// Flatten content-part arrays in a serialized chat-completions body to
+    /// plain strings.
+    ///
+    /// The proxy deserializes message `content` as a `String`, but rig
+    /// serializes it as an array of text parts (e.g.
+    /// `[{"type": "text", "text": "hello"}]`), which the proxy rejects with
+    /// 422. This rewrites `content` in place to the concatenation of its text
+    /// parts, matching the `BodyRewrite::Mira` flattening — but *without* the
+    /// tool-stripping and tool-message deletion that the Mira rewrite also
+    /// performs, which would break tool calling.
+    ///
+    /// Only `messages[].content` is touched; `tools`, `tool_calls`, and
+    /// `role: "tool"` messages are left intact.
+    fn flatten_content_parts(body: &mut Vec<u8>) -> Result<(), serde_json::Error> {
+        let mut value: serde_json::Value = serde_json::from_slice(body)?;
+        if let Some(messages) = value
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for message in messages {
+                let Some(object) = message.as_object_mut() else {
+                    continue;
+                };
+                let Some(content) = object.get_mut("content") else {
+                    continue;
+                };
+                let Some(parts) = content.as_array() else {
+                    continue;
+                };
+                let mut flattened = String::new();
+                for part in parts {
+                    let text = part
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| part.get("refusal").and_then(serde_json::Value::as_str));
+                    if let Some(text) = text {
+                        if !flattened.is_empty() {
+                            flattened.push('\n');
+                        }
+                        flattened.push_str(text);
+                    }
+                }
+                *content = serde_json::Value::String(flattened);
+            }
+        }
+        *body = serde_json::to_vec(&value)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +403,12 @@ impl HttpClientExt for HarnessHttpClient {
         // only captures owned data and doesn't need T: 'static.
         let (parts, body) = req.into_parts();
         let body_bytes: Bytes = body.into();
+        let mut body_bytes: Vec<u8> = body_bytes.to_vec();
+        // The proxy expects message `content` as a plain string; rig sends
+        // content-part arrays. Flatten them here so tools, tool calls and
+        // tool results all pass through untouched.
+        let _ = Self::flatten_content_parts(&mut body_bytes);
+        let body_bytes: Bytes = body_bytes.into();
 
         async move {
             // --- inject current token ---
@@ -443,7 +498,7 @@ impl HttpClientExt for HarnessHttpClient {
 
     fn send_streaming<T>(
         &self,
-        mut req: http::Request<T>,
+        req: http::Request<T>,
     ) -> impl std::future::Future<Output = rig_http::http_client::Result<StreamingResponse>>
            + Send
     where
@@ -454,8 +509,15 @@ impl HttpClientExt for HarnessHttpClient {
         let client = self.clone();
         async move {
             let token = client.current_token().await;
-            Self::inject_token(&mut req, &token);
-            client.inner.send_streaming(req).await
+            // Flatten content-part arrays before forwarding, same as the
+            // unary path — the proxy wants plain-string `content`.
+            let (parts, body) = req.into_parts();
+            let mut bytes: Vec<u8> = body.into().into();
+            let _ = Self::flatten_content_parts(&mut bytes);
+            let mut rebuilt: http::Request<Bytes> =
+                http::Request::from_parts(parts, bytes.into());
+            Self::inject_token(&mut rebuilt, &token);
+            client.inner.send_streaming(rebuilt).await
         }
     }
 }
@@ -576,7 +638,10 @@ impl ClientBuilder {
         // Spawn proactive background refresh.
         spawn_proactive_refresh(Arc::clone(&store), refresher.clone());
 
-        // Build the rig OpenAI client pointed at the proxy with the Mira dialect.
+        // Build the rig OpenAI client pointed at the proxy. Content flattening
+        // happens in the transport (see [`HarnessHttpClient::flatten_content_parts`]);
+        // the dialect itself is plain OpenAI so tools, tool calls and tool
+        // results all pass through untouched.
         let transport = HarnessHttpClient::new(Arc::clone(&store), refresher);
         let openai_client = mira_openai_client(&self.base_url, transport);
 
@@ -588,22 +653,32 @@ impl ClientBuilder {
 // Mira dialect wiring
 // ---------------------------------------------------------------------------
 
-/// Build an [`OpenAI`] client using the Mira dialect, aimed at `base_url`,
-/// sending through `http`.
+/// Build an [`OpenAI`] client aimed at `base_url`, sending through `http`.
 ///
-/// The Mira dialect is an OpenAI-compatible wire with a body rewrite that
-/// flattens content-part arrays to plain strings (matching the proxy's
-/// deserializer). We use `Auth::OptionalBearer` with an empty key because
-/// our transport injects the real token itself.
+/// The dialect is plain OpenAI — no body rewrite — so that `tools`,
+/// `tool_calls`, and `role: "tool"` messages all reach the proxy intact.
+/// Message `content` is serialized by rig as a content-part array, which the
+/// proxy rejects (it types `content` as a string), so the flattening to a
+/// plain string happens in the transport
+/// ([`HarnessHttpClient::flatten_content_parts`]) instead.
+///
+/// We use `Auth::OptionalBearer` with an empty key because our transport
+/// injects the real token itself.
 pub fn mira_openai_client(
     base_url: &str,
     http: impl HttpClientExt + 'static,
 ) -> OpenAI {
     use rig_core::providers::openai::wire::{BodyRewrite, Dialect};
 
-    // Start from the shared OpenAI dialect definition.
+    // Start from the shared OpenAI dialect definition. We deliberately use
+    // `BodyRewrite::None` rather than `BodyRewrite::Mira`: the Mira rewrite
+    // flattens content-part arrays to strings — the one thing the proxy
+    // needs — but also strips `tool_calls` from assistant messages and deletes
+    // every `role: "tool"` message, which breaks tool calling. The content
+    // flattening itself is applied later in [`HarnessHttpClient`] so that
+    // tools, tool calls and tool results all reach the proxy intact.
     let mut quirks = rig_core::providers::openai::wire::OPENAI.quirks;
-    quirks.rewrite = BodyRewrite::Mira;
+    quirks.rewrite = BodyRewrite::None;
 
     let dialect = Dialect {
         quirks,
@@ -727,5 +802,120 @@ mod tests {
         assert!(HarnessHttpClient::is_retryable(&err_429));
         assert!(HarnessHttpClient::is_retryable(&err_500));
         assert!(!HarnessHttpClient::is_retryable(&err_400));
+    }
+
+    // ── flatten_content_parts ─────────────────────────────────────────────
+
+    fn body_with(messages: &[serde_json::Value], tools: Option<&serde_json::Value>) -> Vec<u8> {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "messages".to_string(),
+            serde_json::Value::Array(messages.to_vec()),
+        );
+        if let Some(tools) = tools {
+            map.insert("tools".to_string(), tools.clone());
+        }
+        serde_json::to_vec(&serde_json::Value::Object(map)).unwrap()
+    }
+
+    #[test]
+    fn flatten_content_parts_joins_text_parts() {
+        let body = body_with(
+            &[serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "text", "text": "world"}
+                ]
+            })],
+            None,
+        );
+        let mut body = body;
+        HarnessHttpClient::flatten_content_parts(&mut body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let content = &value["messages"][0]["content"];
+        assert_eq!(content, &serde_json::json!("hello\nworld"));
+    }
+
+    #[test]
+    fn flatten_content_parts_drops_non_text_parts() {
+        // An image part has no `text`/`refusal` key, so it is dropped.
+        let body = body_with(
+            &[serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "image_url", "image_url": {"url": "https://x/y.png"}}
+                ]
+            })],
+            None,
+        );
+        let mut body = body;
+        HarnessHttpClient::flatten_content_parts(&mut body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["messages"][0]["content"], serde_json::json!("a"));
+    }
+
+    #[test]
+    fn flatten_content_parts_leaves_string_content_alone() {
+        let body = body_with(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "already a string"
+            })],
+            None,
+        );
+        let mut body = body;
+        HarnessHttpClient::flatten_content_parts(&mut body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["messages"][0]["content"], serde_json::json!("already a string"));
+    }
+
+    #[test]
+    fn flatten_content_parts_preserves_tool_messages_and_tool_calls() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "read_file"}}]);
+        let body = body_with(
+            &[
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "let me read that"}
+                    ],
+                    "tool_calls": [
+                        {"id": "call_1", "function": {"name": "read_file", "arguments": "{}"}}
+                    ]
+                }),
+                serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "file contents"
+                }),
+            ],
+            Some(&tools),
+        );
+        let mut body = body;
+        HarnessHttpClient::flatten_content_parts(&mut body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Tool messages are preserved.
+        assert!(value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "tool"));
+        // Assistant tool_calls are preserved.
+        assert!(value["messages"][0]["tool_calls"].is_array());
+        // The tools array is untouched.
+        assert!(value["tools"].is_array());
+        // Content got flattened.
+        assert_eq!(value["messages"][0]["content"], serde_json::json!("let me read that"));
+    }
+
+    #[test]
+    fn flatten_content_parts_noop_without_messages_key() {
+        let mut body = serde_json::to_vec(&serde_json::json!({"model": "gemini-2.5-flash"})).unwrap();
+        let original = body.clone();
+        HarnessHttpClient::flatten_content_parts(&mut body).unwrap();
+        assert_eq!(body, original);
     }
 }
