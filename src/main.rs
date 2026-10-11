@@ -28,13 +28,19 @@ async fn main() {
     let id = get_chat_id(&user).await;
 
     let agent = setup_agent().await;
+
+    // TODO: this funciton should send a message to the chat as part of its funciton body
+    // this will not create an infinant loop if the user is not loged in with the same acount as the
+    // bot (see call_on_message_receve)
     let fn_with_agent_stat = async |txt| -> String { call_ai(txt, &agent).await.unwrap() };
-    chat_loop(&user, &id, |txt| {
-        let agent = &agent;
-        async move { call_ai(&txt, agent).await.unwrap() }
-    })
-    .await
-    .unwrap();
+    // chat_loop(&user, &id, |txt| {
+    //     let agent = &agent;
+    //     async move { call_ai(&txt, agent).await.unwrap() }
+    // })
+    // .await
+    // .unwrap();
+    let test_fn = |txt| println!("test func");
+    call_on_message_receve(&user, &id, test_fn).await.unwrap();
 }
 
 // unlike ai, the other use may take a long time to send back a message if they send one back at
@@ -50,25 +56,26 @@ async fn main() {
 //
 // ^ that jsut moves the problem. it dosent realy change anything and is not worth the complexity
 // probaby
-async fn mail(message: &String) -> Result<String, anyhow::Error> {
-    let email = Message::builder()
-        .from("you@example.com")
-        .to("recipient@example.com")
-        .subject("Subject")
-        .body("Hello from Rust!")
-        .unwrap();
 
-    let creds = Credentials::new("smtp_username", "smtp_password");
-    let mailer = SmtpTransport::relay("smtp.mailserver.com")
-        .unwrap()
-        .credentials(creds)
-        .build();
-
-    match mailer.send(&email) {
-        Ok(_) => println!("Email sent successfully!"),
-        Err(e) => eprintln!("Failed to send email: {:?}", e),
-    }
-}
+// async fn mail(message: &String) -> Result<String, anyhow::Error> {
+//     let email = Message::builder()
+//         .from("you@example.com")
+//         .to("recipient@example.com")
+//         .subject("Subject")
+//         .body("Hello from Rust!")
+//         .unwrap();
+//
+//     let creds = Credentials::new("smtp_username", "smtp_password");
+//     let mailer = SmtpTransport::relay("smtp.mailserver.com")
+//         .unwrap()
+//         .credentials(creds)
+//         .build();
+//
+//     match mailer.send(&email) {
+//         Ok(_) => println!("Email sent successfully!"),
+//         Err(e) => eprintln!("Failed to send email: {:?}", e),
+//     }
+// }
 
 async fn setup_agent() -> rig::Agent {
     dotenv().ok();
@@ -96,8 +103,6 @@ async fn setup_agent() -> rig::Agent {
         .build();
     agent
 }
-
-// async fn chat_loop(f: fn(str) -> str) -> Result<(), anyhow::Error> {todo()!}
 
 async fn get_chat_id(user: &LoginPayload) -> uuid::Uuid {
     let chats = get_chats(user).await.unwrap();
@@ -133,14 +138,13 @@ async fn get_chat_id(user: &LoginPayload) -> uuid::Uuid {
     }
 }
 
-async fn chat_loop<F, Fut>(
+async fn call_on_message_receve<F>(
     user: &LoginPayload,
     id: &Uuid,
     response_fn: F,
 ) -> Result<(), anyhow::Error>
 where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = String>,
+    F: Fn(String),
 {
     let agent = setup_agent().await;
 
@@ -167,7 +171,7 @@ where
                 && let Some(_text) = &new_text
             {
                 //&new_text.clone().unwrap()
-                let response = response_fn(new_text.clone().unwrap()).await;
+                let response = response_fn(new_text.clone().unwrap());
                 let echo = SendMessage {
                     sender_name: user.username.clone(),
                     parent_id: Some(*id), //TODO: scary code, should chage
