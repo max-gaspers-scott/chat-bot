@@ -138,6 +138,14 @@ async fn get_chat_id(user: &LoginPayload) -> uuid::Uuid {
     }
 }
 
+/// calls a user provided funciotn on mesage receve
+///
+/// user funciotn must take String as argument (may change to message struct)
+/// the message text will be passed to this arguent when a message is receved.
+///
+/// String may be change to be a message sruct to give users of the bot more flexibility
+///
+///
 async fn call_on_message_receve<F>(
     user: &LoginPayload,
     id: &Uuid,
@@ -172,15 +180,17 @@ where
             {
                 //&new_text.clone().unwrap()
                 let response = response_fn(new_text.clone().unwrap());
-                let echo = SendMessage {
-                    sender_name: user.username.clone(),
-                    parent_id: Some(*id), //TODO: scary code, should chage
-                    content: serde_json::json!({ "text": response}),
-                };
-                match send_message(&user, &echo).await {
-                    Ok(res) => println!("echo sent (id: {:?})", res.data),
-                    Err(e) => println!("failed to send echo: {}", e),
-                }
+                // TODO: move responce fuctionoality to its onw function that the user can call if
+                // they want
+                // let echo = SendMessage {
+                //     sender_name: user.username.clone(),
+                //     parent_id: Some(*id), //TODO: scary code, should chage
+                //     content: serde_json::json!({ "text": response}),
+                // };
+                // match send_message(&user, &echo).await {
+                //     Ok(res) => println!("echo sent (id: {:?})", res.data),
+                //     Err(e) => println!("failed to send echo: {}", e),
+                // }
             }
         }
         last = new;
